@@ -1,0 +1,55 @@
+# =========================
+# macOS
+# =========================
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# =========================
+# Arduino / Build artifacts
+# =========================
+*.elf
+*.hex
+*.bin
+*.map
+*.o
+*.a
+*.d
+*.tmp
+
+# Arduino IDE / CLI build folders
+.build/
+build/
+out/
+
+# =========================
+# PlatformIO (사용할 수도 있으니)
+# =========================
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# =========================
+# IDE / Editor
+# =========================
+.vscode/
+.idea/
+*.code-workspace
+
+# =========================
+# OS / Misc
+# =========================
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# =========================
+# Logs
+# =========================
+*.log
+
+# =========================
+# Git safety
+# =========================
+.gitmodules
+
