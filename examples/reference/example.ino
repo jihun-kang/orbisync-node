@@ -1,15 +1,24 @@
 /**
- * example.ino (NodeMCU ESP8266)
+ * @file    example.ino
+ * @author  jihun kang
+ * @date    2026-01-29
+ * @brief   OrbiSyncNode 라이브러리의 참조 예제 (NodeMCU ESP8266)
  *
- * 목표:
- * - Wi-Fi 연결
- * - OrbiSyncNode 상태머신 loopTick() 실행
- * - 상태/에러를 Serial로 출력
- * - (옵션) heartbeat 때 내장 LED 깜빡임
+ * @details
+ * 이 파일은 OrbiSyncNode 라이브러리의 완전한 사용 예제를 제공합니다.
+ * WiFi 연결, Hub 통신, 상태 머신 관리, LED 패턴 표시, 상세 로깅 등의 기능을 포함합니다.
  *
- * 보드:
- * - NodeMCU ESP8266
- * - 내장 LED: 보통 D4(GPIO2), Active-Low(LOW=켜짐)
+ * - WiFi 연결 및 Hub 초기화
+ * - 상태 머신 기반 인증/세션 관리
+ * - 상태별 LED 패턴 표시 (BOOT/HELLO/PENDING/ACTIVE/ERROR)
+ * - Serial 로그를 통한 상세 상태 모니터링
+ * - WebSocket 터널 연결 및 노드 등록 상태 확인
+ *
+ * 보드: NodeMCU ESP8266
+ * 내장 LED: D4(GPIO2), Active-Low (LOW=켜짐)
+ *
+ * 본 코드는 OrbiSync 오픈소스 프로젝트의 일부입니다.
+ * 라이선스 및 사용 조건은 LICENSE 파일을 참고하세요.
  */
 
  #include <Arduino.h>

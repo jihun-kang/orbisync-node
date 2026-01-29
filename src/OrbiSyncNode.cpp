@@ -1,3 +1,24 @@
+/**
+ * @file    OrbiSyncNode.cpp
+ * @author  jihun kang
+ * @date    2026-01-29
+ * @brief   OrbiSyncNode 라이브러리의 핵심 구현
+ *
+ * @details
+ * 이 파일은 OrbiSyncNode 클래스의 모든 메서드를 구현합니다.
+ * 상태 머신 실행, Hub와의 HTTP/HTTPS 통신, WebSocket 터널링,
+ * 노드 등록, 이벤트 콜백 디스패치 등의 로직을 포함합니다.
+ *
+ * - 상태 머신 구현 (HELLO → PENDING_POLL → ACTIVE 전이 처리)
+ * - Hub API 통신 (hello, session, heartbeat, commands, node registration)
+ * - WebSocket 터널 연결 및 HTTP 요청/응답 멀티플렉싱
+ * - 이벤트 콜백 디스패치 (상태 변경, 에러, 등록, 터널 연결)
+ * - 지수 백오프를 통한 네트워크 오류 처리
+ *
+ * 본 코드는 OrbiSync 오픈소스 프로젝트의 일부입니다.
+ * 라이선스 및 사용 조건은 LICENSE 파일을 참고하세요.
+ */
+
 #include "OrbiSyncNode.h"
 
 #include <ArduinoJson.hpp>
@@ -45,7 +66,14 @@ OrbiSyncNode::OrbiSyncNode(const Config& config)
     ws_last_heartbeat_ms_(0),
     ws_connected_(false),
     ws_register_frame_sent_(false),
-    stream_open_(false) {
+    stream_open_(false),
+    request_handler_(nullptr),
+    state_change_callback_(nullptr),
+    error_callback_(nullptr),
+    register_callback_(nullptr),
+    tunnel_callback_(nullptr),
+    ws_connected_prev_(false),
+    state_prev_(State::BOOT) {
   session_token_[0] = '\0';
   last_error_[0] = '\0';
   node_id_[0] = '\0';
@@ -58,7 +86,7 @@ OrbiSyncNode::OrbiSyncNode(const Config& config)
   applyTlsPolicy();
   if (config_.hubBaseUrl == nullptr || config_.slotId == nullptr) {
     setLastError("설정 오류: hubBaseUrl 또는 slotId 누락");
-    state_ = State::ERROR;
+    transitionTo(State::ERROR);
   }
   randomSeed(ESP.getChipId() ^ micros());
   s_ws_instance = this;
@@ -174,7 +202,7 @@ bool OrbiSyncNode::sendHello() {
 
   uint32_t now = millis();
   if (strcmp(status, "PENDING") == 0 || strcmp(status, "APPROVED") == 0) {
-    state_ = State::PENDING_POLL;
+    transitionTo(State::PENDING_POLL);
     uint32_t retry = doc["retry_after_ms"] | kDefaultPendingRetryMs;
     next_net_action_ms_ = now + retry;
     net_backoff_ms_ = kInitialBackoffMs;
@@ -185,7 +213,7 @@ bool OrbiSyncNode::sendHello() {
   if (strcmp(status, "DENIED") == 0) {
     setLastError("HELLO 거절됨");
     clearSession();
-    state_ = State::HELLO;
+    transitionTo(State::HELLO);
     scheduleNextNetwork();
     return false;
   }
@@ -229,7 +257,7 @@ bool OrbiSyncNode::pollSession() {
   if (http_code == 401 || http_code == 403) {
     setLastError("SESSION 인증 실패");
     clearSession();
-    state_ = State::HELLO;
+    transitionTo(State::HELLO);
     scheduleNextNetwork();
     return false;
   }
@@ -249,7 +277,7 @@ bool OrbiSyncNode::pollSession() {
 
   if (strcmp(status, "PENDING") == 0) {
     uint32_t retry = doc["retry_after_ms"] | kDefaultPendingRetryMs;
-    state_ = State::PENDING_POLL;
+    transitionTo(State::PENDING_POLL);
     next_net_action_ms_ = now + retry;
     return true;
   }
@@ -259,7 +287,7 @@ bool OrbiSyncNode::pollSession() {
     if (token == nullptr || strlen(token) >= sizeof(session_token_)) {
       setLastError("SESSION 토큰 오류");
       clearSession();
-      state_ = State::HELLO;
+      transitionTo(State::HELLO);
       scheduleNextNetwork();
       return false;
     }
@@ -267,7 +295,7 @@ bool OrbiSyncNode::pollSession() {
     session_token_[sizeof(session_token_) - 1] = '\0';
     uint32_t ttl = doc["ttl_seconds"] | 3600;
     session_expires_at_ms_ = now + ttl * 1000;
-    state_ = State::ACTIVE;
+    transitionTo(State::ACTIVE);
     last_heartbeat_ms_ = now;
     next_net_action_ms_ = now;
     net_backoff_ms_ = kInitialBackoffMs;
@@ -280,7 +308,7 @@ bool OrbiSyncNode::pollSession() {
   if (strcmp(status, "DENIED") == 0) {
     setLastError("SESSION 거절됨");
     clearSession();
-    state_ = State::HELLO;
+    transitionTo(State::HELLO);
     scheduleNextNetwork();
     return false;
   }
@@ -337,7 +365,7 @@ bool OrbiSyncNode::sendHeartbeat() {
   if (http_code == 401 || http_code == 403) {
     setLastError("Heartbeat 인증 실패");
     clearSession();
-    state_ = State::HELLO;
+    transitionTo(State::HELLO);
     scheduleNextNetwork();
     return false;
   }
@@ -429,7 +457,6 @@ bool OrbiSyncNode::handleCommand(JsonObject command) {
     setLastError("명령 구조 오류");
     return false;
   }
-  Serial.printf("[OrbiSync] 명령 수신 id=%s action=%s\n", cmd_id, action);
 
   String url = String(config_.hubBaseUrl) + "/api/device/commands/ack";
   WiFiClient& client = use_https_ ? static_cast<WiFiClient&>(secure_client_) : insecure_client_;
@@ -474,11 +501,16 @@ void OrbiSyncNode::loopTick() {
   uint32_t now = millis();
   ensureWiFi();
 
+  // WS 연결 상태 변화 감지
+  bool ws_connected_current = ws_connected_;
   if (config_.enableTunnel) {
     ws_client_.loop();
     if (!ws_connected_) {
       connectTunnelWs(now);
     }
+  }
+  if (ws_connected_current != ws_connected_) {
+    // WS 연결 상태 변화는 handleWsEvent에서 처리됨
   }
 
   if (state_ == State::ERROR) {
@@ -486,13 +518,13 @@ void OrbiSyncNode::loopTick() {
   }
 
   if (state_ == State::BOOT && WiFi.status() == WL_CONNECTED) {
-    state_ = State::HELLO;
+    transitionTo(State::HELLO);
     next_net_action_ms_ = now;
   }
 
   if (state_ == State::ACTIVE && (!isSessionValid() || WiFi.status() != WL_CONNECTED)) {
     clearSession();
-    state_ = State::HELLO;
+    transitionTo(State::HELLO);
     next_net_action_ms_ = now;
   }
 
@@ -581,8 +613,11 @@ bool OrbiSyncNode::registerNodeIfNeeded(uint32_t now) {
   if (success) {
     register_backoff_ms_ = config_.registerRetryMs ? config_.registerRetryMs : kInitialBackoffMs;
     next_register_action_ms_ = now;
-    Serial.printf("[OrbiSync] 노드 등록 완료 node_id=%s\n", node_id_);
     is_registered_ = true;
+    // 등록 성공 콜백 호출
+    if (register_callback_ != nullptr && node_id_[0] != '\0') {
+      register_callback_(node_id_);
+    }
     return true;
   }
 
@@ -595,7 +630,6 @@ bool OrbiSyncNode::registerBySlot() {
     setLastError("slot 기반 등록 정보 부족");
     return false;
   }
-  Serial.printf("[OrbiSync] register_by_slot slot=%s\n", config_.slotId);
   String url = String(config_.hubBaseUrl) + "/api/nodes/register_by_slot";
   WiFiClient& client = use_https_ ? static_cast<WiFiClient&>(secure_client_) : insecure_client_;
   if (!http_.begin(client, url)) {
@@ -649,7 +683,6 @@ bool OrbiSyncNode::registerBySlot() {
     tunnel_url_[0] = '\0';
   }
 
-  Serial.printf("[OrbiSync] register_by_slot success id=%s auth=%s\n", node_id_, node_auth_token_);
   return true;
 }
 
@@ -658,7 +691,6 @@ bool OrbiSyncNode::registerByPairing() {
     setLastError("pairing 등록 정보 부족");
     return false;
   }
-  Serial.printf("[OrbiSync] register by pairing slot=%s\n", config_.slotId);
   String url = String(config_.hubBaseUrl) + "/api/nodes/register";
   WiFiClient& client = use_https_ ? static_cast<WiFiClient&>(secure_client_) : insecure_client_;
   if (!http_.begin(client, url)) {
@@ -713,7 +745,6 @@ bool OrbiSyncNode::registerByPairing() {
   } else {
     tunnel_url_[0] = '\0';
   }
-  Serial.printf("[OrbiSync] pairing 등록 성공 id=%s auth=%s\n", node_id_, node_auth_token_);
   return true;
 }
 
@@ -746,7 +777,6 @@ bool OrbiSyncNode::connectTunnelWs(uint32_t now) {
     ws_client_.begin(host.c_str(), port, path.c_str());
   }
 
-  Serial.printf("[OrbiSync] WS 연결 시도 %s://%s%s\n", secure ? "wss" : "ws", host.c_str(), path.c_str());
   uint32_t delay = ws_backoff_ms_ ? ws_backoff_ms_ : kInitialBackoffMs;
   next_ws_action_ms_ = now + delay;
   ws_backoff_ms_ = min(ws_backoff_ms_ ? ws_backoff_ms_ * 2 : kInitialBackoffMs, kMaxBackoffMs);
@@ -779,7 +809,6 @@ bool OrbiSyncNode::sendRegisterFrame() {
     Serial.printf("[OrbiSync] WS reg payload: %s\n", frame.c_str());
   }
   bool ok = ws_client_.sendTXT(frame);
-  Serial.println("[OrbiSync] WS register frame 전송");
   if (ok) {
     ws_register_frame_sent_ = true;
     ws_last_heartbeat_ms_ = millis();
@@ -807,7 +836,6 @@ bool OrbiSyncNode::sendHeartbeatFrame() {
     Serial.printf("[OrbiSync] WS heartbeat payload: %s\n", frame.c_str());
   }
   bool ok = ws_client_.sendTXT(frame);
-  Serial.println("[OrbiSync] WS heartbeat 전송");
   if (ok) {
     ws_last_heartbeat_ms_ = millis();
   } else {
@@ -823,18 +851,36 @@ bool OrbiSyncNode::sendHeartbeatFrame() {
 void OrbiSyncNode::handleWsEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_DISCONNECTED:
+      if (ws_connected_) {
+        ws_connected_prev_ = ws_connected_;
+      }
       ws_connected_ = false;
       ws_register_frame_sent_ = false;
-      Serial.println("[OrbiSync] WS 이벤트: 끊김");
+      if (ws_connected_prev_) {
+        ws_connected_prev_ = false;
+        // 터널 해제 콜백 호출
+        if (tunnel_callback_ != nullptr) {
+          tunnel_callback_(false, tunnel_url_);
+        }
+      }
       scheduleWsRetry(millis());
       break;
     case WStype_CONNECTED:
+      if (!ws_connected_) {
+        ws_connected_prev_ = false;
+      }
       ws_connected_ = true;
       ws_register_frame_sent_ = false;
       ws_last_heartbeat_ms_ = millis();
       ws_backoff_ms_ = kInitialBackoffMs;
       next_ws_action_ms_ = 0;
-      Serial.println("[OrbiSync] WS 이벤트: 연결됨");
+      if (!ws_connected_prev_) {
+        ws_connected_prev_ = true;
+        // 터널 연결 콜백 호출
+        if (tunnel_callback_ != nullptr) {
+          tunnel_callback_(true, tunnel_url_);
+        }
+      }
       sendRegisterFrame();
       break;
     case WStype_TEXT:
@@ -874,12 +920,10 @@ void OrbiSyncNode::handleControl(JsonDocument& doc) {
     active_stream_id_[sizeof(active_stream_id_) - 1] = '\0';
     stream_open_ = true;
     request_buf_.clear();
-    Serial.printf("[OrbiSync] stream open id=%s\n", active_stream_id_);
   } else if (strcmp(cmd, "close_stream") == 0) {
     if (strcmp(active_stream_id_, streamId) == 0) {
       stream_open_ = false;
       request_buf_.clear();
-      Serial.printf("[OrbiSync] stream close id=%s\n", streamId);
     }
   }
 }
@@ -912,7 +956,6 @@ void OrbiSyncNode::handleData(JsonDocument& doc) {
     return;
   }
   request_buf_.concat(reinterpret_cast<const char*>(decoded), decodedLen);
-  Serial.println("[OrbiSync] data(c2n) 수신");
   tryProcessHttpRequest();
 }
 
@@ -949,9 +992,48 @@ bool OrbiSyncNode::tryProcessHttpRequest() {
   if (contentLen > 0) {
     body = request_buf_.substring(bodyStart, bodyStart + contentLen);
   }
+  
   int statusCode = 200;
-  String json = routeHttpRequest(method, path, body, statusCode);
-  String raw = buildHttpRawResponse(statusCode, json);
+  String jsonBody;
+  const char* contentType = "application/json";
+  
+  // 먼저 등록된 handler 호출
+  bool useHandler = false;
+  if (request_handler_ != nullptr) {
+    Request req;
+    req.proto = Protocol::HTTP;
+    req.method = method.c_str();
+    req.path = path.c_str();
+    req.body = reinterpret_cast<const uint8_t*>(body.c_str());
+    req.body_len = body.length();
+    
+    Response resp;
+    resp.status = 200;
+    resp.content_type = "application/json";
+    resp.body = nullptr;
+    resp.body_len = 0;
+    
+    bool handled = request_handler_(req, resp);
+    if (handled && resp.body != nullptr && resp.body_len > 0) {
+      // handler가 true 반환하고 응답 제공: 그 응답 사용
+      statusCode = resp.status;
+      contentType = resp.content_type ? resp.content_type : "application/json";
+      // ESP8266 메모리 고려: String 대신 직접 복사
+      jsonBody.reserve(resp.body_len + 1);
+      jsonBody = "";
+      for (size_t i = 0; i < resp.body_len; i++) {
+        jsonBody += static_cast<char>(resp.body[i]);
+      }
+      useHandler = true;
+    }
+  }
+  
+  // handler가 처리하지 않았거나 미등록: 기본 라우팅으로 fallback
+  if (!useHandler) {
+    jsonBody = routeHttpRequest(method, path, body, statusCode);
+  }
+  
+  String raw = buildHttpRawResponse(statusCode, jsonBody, contentType);
   sendDataFrame(active_stream_id_, (const uint8_t*)raw.c_str(), raw.length());
   stream_open_ = false;
   request_buf_.clear();
@@ -977,10 +1059,10 @@ String OrbiSyncNode::routeHttpRequest(const String& method, const String& path, 
   return response;
 }
 
-String OrbiSyncNode::buildHttpRawResponse(int statusCode, const String& jsonBody) {
+String OrbiSyncNode::buildHttpRawResponse(int statusCode, const String& jsonBody, const char* contentType) {
   const char* statusText = (statusCode == 200) ? "OK" : (statusCode == 404 ? "Not Found" : "Error");
   String raw = "HTTP/1.1 " + String(statusCode) + " " + statusText + "\r\n";
-  raw += "Content-Type: application/json\r\n";
+  raw += "Content-Type: " + String(contentType ? contentType : "application/json") + "\r\n";
   raw += "Content-Length: " + String(jsonBody.length()) + "\r\n";
   raw += "Connection: close\r\n";
   raw += "\r\n";
@@ -1003,7 +1085,6 @@ bool OrbiSyncNode::sendDataFrame(const char* streamId, const uint8_t* data, size
   if (ORBI_SYNC_WS_DEBUG) {
     Serial.printf("[OrbiSync] WS data payload: %s\n", frame.c_str());
   }
-  Serial.println("[OrbiSync] WS data(n2c) 전송");
   return ws_client_.sendTXT(frame);
 }
 
@@ -1056,7 +1137,6 @@ bool OrbiSyncNode::base64Decode(const char* input, uint8_t* output, size_t& outL
 
 void OrbiSyncNode::scheduleWsRetry(uint32_t now) {
   uint32_t delay = ws_backoff_ms_ ? ws_backoff_ms_ : kInitialBackoffMs;
-  Serial.printf("[OrbiSync] WS retry in %lu ms\n", delay);
   next_ws_action_ms_ = now + delay;
   ws_backoff_ms_ = min(ws_backoff_ms_ ? ws_backoff_ms_ * 2 : kInitialBackoffMs, kMaxBackoffMs);
   ws_register_frame_sent_ = false;
@@ -1150,8 +1230,46 @@ String OrbiSyncNode::createNonce() {
 }
 
 void OrbiSyncNode::setLastError(const char* msg) {
+  if (msg == nullptr) {
+    return;
+  }
+  bool error_changed = (strcmp(last_error_, msg) != 0);
   strncpy(last_error_, msg, sizeof(last_error_) - 1);
   last_error_[sizeof(last_error_) - 1] = '\0';
+  if (error_changed && error_callback_ != nullptr) {
+    error_callback_(last_error_);
+  }
+}
+
+void OrbiSyncNode::transitionTo(State newState) {
+  if (state_ != newState) {
+    State oldState = state_;
+    state_prev_ = state_;
+    state_ = newState;
+    if (state_change_callback_ != nullptr) {
+      state_change_callback_(oldState, newState);
+    }
+  }
+}
+
+void OrbiSyncNode::onRequest(RequestCallback callback) {
+  request_handler_ = callback;
+}
+
+void OrbiSyncNode::onStateChange(StateChangeCallback callback) {
+  state_change_callback_ = callback;
+}
+
+void OrbiSyncNode::onError(ErrorCallback callback) {
+  error_callback_ = callback;
+}
+
+void OrbiSyncNode::onRegistered(RegisterCallback callback) {
+  register_callback_ = callback;
+}
+
+void OrbiSyncNode::onTunnelChange(TunnelCallback callback) {
+  tunnel_callback_ = callback;
 }
 
 void OrbiSyncNode::scheduleNextNetwork(uint32_t delayMs) {

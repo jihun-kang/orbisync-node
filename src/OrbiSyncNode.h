@@ -1,3 +1,23 @@
+/**
+ * @file    OrbiSyncNode.h
+ * @author  jihun kang
+ * @date    2026-01-29
+ * @brief   OrbiSyncNode 라이브러리의 public API 및 클래스 정의
+ *
+ * @details
+ * 이 파일은 OrbiSyncNode 라이브러리의 핵심 인터페이스를 정의합니다.
+ * ESP8266/ESP32 기반 IoT 노드가 OrbiSync Hub와 통신하기 위한 상태 머신,
+ * 콜백 인터페이스, 요청/응답 구조체를 제공합니다.
+ *
+ * - 상태 머신 정의 (BOOT → HELLO → PENDING_POLL → ACTIVE → ERROR)
+ * - 이벤트 콜백 인터페이스 (상태 변경, 에러, 등록, 터널 연결, HTTP 요청)
+ * - HTTP/COAP 요청 처리 구조체 (Request/Response)
+ * - WiFi 연결, Hub 통신, WebSocket 터널링 API
+ *
+ * 본 코드는 OrbiSync 오픈소스 프로젝트의 일부입니다.
+ * 라이선스 및 사용 조건은 LICENSE 파일을 참고하세요.
+ */
+
 #ifndef ORBI_SYNC_NODE_H
 #define ORBI_SYNC_NODE_H
 
@@ -41,6 +61,33 @@ public:
     ACTIVE,
     ERROR
   };
+
+  enum class Protocol {
+    HTTP,
+    COAP
+  };
+
+  struct Request {
+    Protocol proto;
+    const char* method;
+    const char* path;
+    const uint8_t* body;
+    size_t body_len;
+  };
+
+  struct Response {
+    int status;
+    const char* content_type;
+    const uint8_t* body;
+    size_t body_len;
+  };
+
+  using RequestHandler = bool(*)(const Request&, Response&);
+  using RequestCallback = RequestHandler; // 별칭
+  using StateChangeCallback = void(*)(State oldState, State newState);
+  using ErrorCallback = void(*)(const char* error);
+  using RegisterCallback = void(*)(const char* nodeId);
+  using TunnelCallback = void(*)(bool connected, const char* url);
 
   struct Config {
     const char* hubBaseUrl;
@@ -133,6 +180,42 @@ public:
   const char* getLastError() const;
   void clearSession();
 
+  /**
+   * 역할: HTTP/COAP 요청 처리 핸들러 등록
+   * 인자: 요청 처리 콜백 함수 포인터
+   * 반환: 없음
+   * 참고: callback이 true를 반환하면 그 응답을 사용, false면 기본 라우팅으로 fallback
+   */
+  void onRequest(RequestCallback callback);
+
+  /**
+   * 역할: 상태 변경 콜백 등록
+   * 인자: 상태 변경 시 호출될 콜백 함수 포인터
+   * 반환: 없음
+   */
+  void onStateChange(StateChangeCallback callback);
+
+  /**
+   * 역할: 에러 발생 콜백 등록
+   * 인자: 에러 발생 시 호출될 콜백 함수 포인터
+   * 반환: 없음
+   */
+  void onError(ErrorCallback callback);
+
+  /**
+   * 역할: 노드 등록 완료 콜백 등록
+   * 인자: 노드 등록 성공 시 호출될 콜백 함수 포인터
+   * 반환: 없음
+   */
+  void onRegistered(RegisterCallback callback);
+
+  /**
+   * 역할: 터널(WebSocket) 연결 상태 변경 콜백 등록
+   * 인자: 터널 연결/해제 시 호출될 콜백 함수 포인터
+   * 반환: 없음
+   */
+  void onTunnelChange(TunnelCallback callback);
+
   bool registerNodeIfNeeded(uint32_t now);
   bool registerBySlot();
   bool registerByPairing();
@@ -145,6 +228,7 @@ private:
   bool ensureWiFi();
   String createNonce();
   void setLastError(const char* msg);
+  void transitionTo(State newState);
   void scheduleNextNetwork(uint32_t delayMs = 0);
   void scheduleNextWiFi(uint32_t delayMs = 0);
   void processActive(uint32_t now);
@@ -159,7 +243,7 @@ private:
   void handleControl(JsonDocument& doc);
   void handleData(JsonDocument& doc);
   bool tryProcessHttpRequest();
-  String buildHttpRawResponse(int statusCode, const String& jsonBody);
+  String buildHttpRawResponse(int statusCode, const String& jsonBody, const char* contentType = "application/json");
   String routeHttpRequest(const String& method, const String& path, const String& body, int& statusCode);
   bool sendDataFrame(const char* streamId, const uint8_t* data, size_t len);
   static String base64Encode(const uint8_t* data, size_t length);
@@ -207,6 +291,13 @@ private:
   uint32_t ws_backoff_ms_;
   uint32_t next_ws_action_ms_;
   uint32_t ws_last_heartbeat_ms_;
+  RequestHandler request_handler_;
+  StateChangeCallback state_change_callback_;
+  ErrorCallback error_callback_;
+  RegisterCallback register_callback_;
+  TunnelCallback tunnel_callback_;
+  bool ws_connected_prev_;
+  State state_prev_;
 };
 
 #endif // ORBI_SYNC_NODE_H
