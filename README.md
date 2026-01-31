@@ -1,108 +1,151 @@
 # OrbiSyncNode
 
-**OrbiSyncNode**는 ESP8266 / ESP32 기반 디바이스를 위한 **Hub 중심 · 세션 기반 IoT 노드 라이브러리**입니다.
+**OrbiSyncNode**는 ESP8266 / ESP32 기반 디바이스를 위한  
+**Hub 중심 · 세션 기반 · RAM-only 인증 IoT 노드 라이브러리**입니다.
 
-이 라이브러리는 디바이스에 **영구 자격 증명을 저장하지 않는 것**을 핵심 원칙으로 설계되었으며,  
-모든 인증과 제어는 OrbiSync Hub를 통해 이루어집니다.
+이 라이브러리는 디바이스를 **신뢰하지 않는(Zero-Trust)** 구조를 따르며,  
+모든 인증 · 슬롯 정책 · 제어 · 명령 처리는 **Hub가 책임**집니다.
 
----
-
-## ✨ Key Concepts
-
-- 🔒 **RAM-only Session**
-  - Flash / EEPROM에 토큰이나 키를 저장하지 않음
-  - 재부팅 시 모든 인증 상태는 초기화
-
-- 🔁 **Polling-based Authorization**
-  - Node는 주기적으로 Hub에 상태를 질의
-  - 승인 여부는 Hub + Web UI에서 제어
-
-- 🧠 **Explicit State Machine**
-  - BOOT → HELLO → PENDING_POLL → ACTIVE
-  - 상태가 명확하고 디버깅이 쉬움
-
-- 🌐 **HTTP / HTTPS + WebSocket Tunnel**
-  - 기본은 HTTP(S)
-  - 필요 시 Hub를 통한 WebSocket 터널링 지원
+디바이스에는 **영구 토큰/키를 절대 저장하지 않습니다.**
 
 ---
 
-## 🧩 Architecture Overview
+# ✨ Key Features
 
-OrbiSync는 **디바이스 신뢰를 최소화하고**,  
-**사람(Web UI)과 Hub가 승인 책임을 갖는 구조**를 채택합니다.
+## 🔒 RAM-only Session
+- Flash / EEPROM 저장 없음
+- 토큰은 RAM에만 존재
+- 재부팅 시 자동 로그아웃 (보안 ↑)
+
+## 🔁 Hub-centered Authorization
+- Node는 Hub에만 통신
+- Web UI는 Hub DB만 조회/관리
+- Node ↔ Web 직접 통신 없음
+
+## 🧠 Explicit State Machine
 
 ```
+BOOT → HELLO → PENDING_POLL → ACTIVE → ERROR
+```
+
+디버깅/운영이 매우 쉬움
+
+## 🌐 HTTP/HTTPS + WebSocket Tunnel
+- 기본: HTTP Polling
+- 옵션: WebSocket 터널
+- NAT/방화벽 환경에서도 안정적
+
+---
+
+# 🧩 Architecture Overview
+
+> Web은 관리/결제/대시보드 역할  
+> Hub는 정책/인증/슬롯관리/명령중계 역할  
+> Node는 세션 참여자 역할
+
+```mermaid
+flowchart LR
+
+  subgraph WEB["Web (관리/결제/대시보드)"]
+    WUI[Admin UI]
+    WDB[(Web DB\nusers / plans / licenses)]
+  end
+
+  subgraph HUB["Hub (정책 집행 / IoT 게이트)"]
+    HAPI[Hub API]
+    HDB[(Hub DB\nslots / nodes / sessions / commands)]
+    ENF[Policy Enforcer]
+  end
+
+  subgraph NODE["ESP8266 / ESP32 Node"]
+    N[OrbiSyncNode]
+  end
+
+  WUI --> WDB
+  WDB -->|slot/license sync| HAPI
+  N -->|HELLO / SESSION / POLL| HAPI
+  HAPI --> ENF
+  ENF --> HDB
+  WUI -->|조회| HAPI
+```
+
+---
+
+# 🧭 Protocol Timeline
+
+⚠️ 중요  
+`(heartbeat + command pull)`은 **Node가 추가 요청을 보내는 것이 아닙니다.**  
+Hub가 `/session` 요청 내부에서 **last_seen 갱신 + 명령 조회를 동시에 처리**한다는 의미입니다.
+
+```text
 시간 →
-Arduino(Node)          Hub                     Web(UI)
-     |                   |                        |
-     |--- HELLO -------->|                        |
-     |<-- PENDING -------|                        |
-     |--- POLL_SESSION ->|                        |
-     |<-- PENDING -------|                        |
-     |                   |<--- GET pending list --|
-     |                   |---- pending list ----->|
-     |                   |<--- APPROVE(slot_id) --|
-     |                   | (Hub DB 상태 갱신)       |
-     |--- POLL_SESSION ->|                        |
-     |<-- GRANTED -------|                        |
-     |==== ACTIVE MODE ===========================|
-     |--- REQUEST(token)->|                       |
-     |<-- RESPONSE -------|                       |
-     |                    |                       |
-     | (TTL 만료/재부팅)     |                       |
-     |--- HELLO/POLL ---->|                       |
+Arduino(Node)                    Hub                                        Web(UI)
+     |                             |                                          |
+     |--- HELLO(slot_id, mac) ---->|                                          |
+     |                             |-- check slot policy (max_nodes, status)  |
+     |                             |-- calc used_nodes (active + last_seen)   |
+     |<-- GRANTED(token, ttl) -----|  (used < max && active license)          |
+     |                             |                                          |
+     |--- POLL_SESSION(token) ---->|                                          |
+     |<-- SESSION_OK + cmds/empty -|  (heartbeat + command pull)              |
+     |--- POLL_SESSION ----------->|                                          |
+     |<-- SESSION_OK + events -----|                                          |
+     |--- POLL_SESSION ----------->|                                          |
+     |<-- SESSION_OK --------------|                                          |
+     |                             |-- update last_seen / node state          |
+     |                             |                                          |
+     |                             |<---------- GET /slots -------------------|  (웹 화면 로딩)
+     |                             |---------- slots summary ---------------->|
+     |                             |<---------- GET /nodes?slot=... ----------|
+     |                             |---------- nodes list ------------------->|
+     |                             |                                          |
+     ----- 가입/업그레이드/다운그레이드 발생 ------------------------------------------
+     |                             |<--- POST /slots/update(slot,max,ver) ----|  (웹→허브 즉시 반영)
+     |                             |    (Hub DB: max_nodes/status/version)    |
+     |                             |--- 200 OK ------------------------------>|
+     |                             |                                          |
+  ----- 슬롯 초과 시 ---------------------------------------------------------------
+     |--- HELLO(slot_id, mac) ---->|                                          |
+     |<-- DENIED(FULL, retry_after)|  (used >= max OR suspended)              |
+     |--- (backoff) -------------->|                                          |
+     |--- HELLO(retry) ----------->|                                          |
+     |<-- DENIED(FULL) -----------|                                           |
 ```
 
-### ACTIVE MODE
-ACTIVE 상태에서는 **모든 요청에 session token이 포함**됩니다.  
-토큰은 RAM에만 존재하며, TTL 만료 또는 재부팅 시 자동으로 초기 상태로 복귀합니다.
+---
+
+# 🔁 State Machine
+
+| State | 설명 |
+|-------|------------------------------|
+| BOOT | 초기화 |
+| HELLO | Hub에 접속 요청 |
+| PENDING_POLL | 승인 대기 |
+| ACTIVE | 정상 운영 |
+| ERROR | 네트워크/인증 실패 |
 
 ---
 
-##  Requirements
-
-- ESP8266 또는 ESP32
-- ArduinoJson **>= 7.4.0**
-- WebSockets **>= 2.7.2** (by Markus Sattler)
-
----
-
-##  Installation
-
-### Arduino Library Manager
-Arduino IDE → Library Manager → `OrbiSyncNode` 검색 후 설치
-
-### Manual Installation
-1. 이 저장소를 다운로드 또는 clone
-2. `OrbiSyncNode` 폴더를 Arduino `libraries` 디렉토리에 복사
-3. Arduino IDE 재시작
-
----
-
-##  Quick Start (Minimal Example)
-
-> 이 예제는 **가장 최소한의 설정**만 보여줍니다.  
-> 고급 옵션은 `examples/reference/example`을 참고하세요.
+# 🚀 Quick Start (Minimal Example)
 
 ```cpp
 #include <OrbiSyncNode.h>
 
 const char* WIFI_SSID = "your_ssid";
 const char* WIFI_PASS = "your_password";
-const char* HUB_BASE_URL = "https://hub.orbisync.io";
-const char* SLOT_ID = "your_slot_id";
+const char* HUB_URL   = "https://hub.orbisync.io";
+const char* SLOT_ID   = "your_slot_id";
 
-const char* capabilities[] = {"heartbeat", "commands"};
+const char* caps[] = {"heartbeat","commands"};
 
 OrbiSyncNode::Config config = {
-  HUB_BASE_URL,
-  SLOT_ID,
-  "1.1.2",
-  capabilities,
-  2,
-  5000,
-  LED_BUILTIN
+  .hubBaseUrl = HUB_URL,
+  .slotId = SLOT_ID,
+  .firmwareVersion = "1.0.0",
+  .capabilities = caps,
+  .capabilityCount = 2,
+  .heartbeatIntervalMs = 5000,
+  .ledPin = LED_BUILTIN
 };
 
 OrbiSyncNode node(config);
@@ -114,49 +157,57 @@ void setup() {
 
 void loop() {
   node.loopTick();
-  delay(10);
 }
 ```
 
 ---
 
-##  Examples
+# 📦 Installation
 
-- **`basic_smoke_test`**
-  - WiFi 연결 + 기본 동작 확인용 최소 예제
+## Arduino Library Manager
+Arduino IDE → Library Manager → `OrbiSyncNode` 검색
 
-- **`reference/example`**
-  - 권장 예제
-  - LED 상태 표시, 터널링, throttling, 상세 로그 포함
-
----
-
-##  Hub API Interaction
-
-- `POST /api/device/hello`
-- `POST /api/device/session`
-- `POST /api/device/heartbeat`
-- `POST /api/nodes/register_by_slot`
-- WebSocket Tunnel: `wss://hub.orbisync.io/tunnel/{node_id}`
+## Manual
+`libraries/OrbiSyncNode/` 폴더에 복사
 
 ---
 
-##  Notes & Design Philosophy
+# 🧪 Examples
+
+- basic_smoke_test → 최소 동작 테스트
+- reference/example → 전체 기능 예제
+
+---
+
+# 🔌 Hub API Interaction
+
+| Endpoint | 설명 |
+|------------------------------|----------------------------|
+| POST /api/device/hello | 세션 요청 |
+| POST /api/device/session | poll + heartbeat 의미 + 명령 조회 |
+| POST /api/device/heartbeat | (옵션) 분리형 heartbeat |
+| POST /api/nodes/register_by_slot | 노드 등록 |
+| wss://hub/.../tunnel | 터널 |
+
+---
+
+# 🧠 Notes & Design Philosophy
 
 - 디바이스는 **절대 신뢰 대상이 아님**
-- 장기 토큰 / API Key를 펌웨어에 넣지 않음
-- 승인 흐름은 **사람(Web UI) + Hub가 통제**
-- IoT 디바이스를 “계정”이 아닌 **세션 참여자**로 취급
+- 장기 토큰 / API Key 저장 금지
+- 인증/정책은 Hub가 담당
+- Web은 관리 전용
+- Node는 세션 참여자
 
 ---
 
-##  Supported Boards
+# ✅ Supported Boards
 
 - ESP8266 (NodeMCU 등)
 - ESP32
 
 ---
 
-##  License
+# 📄 License
 
 MIT License
