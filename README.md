@@ -1,7 +1,6 @@
 # OrbiSyncNode
 
-**OrbiSyncNode**는 ESP8266 / ESP32 기반 디바이스를 위한  
-**Hub 중심 · 세션 기반 IoT 노드 라이브러리**입니다.
+**OrbiSyncNode**는 ESP8266 / ESP32 기반 디바이스를 위한 **Hub 중심 · 세션 기반 IoT 노드 라이브러리**입니다.
 
 이 라이브러리는 디바이스에 **영구 자격 증명을 저장하지 않는 것**을 핵심 원칙으로 설계되었으며,  
 모든 인증과 제어는 OrbiSync Hub를 통해 이루어집니다.
@@ -36,23 +35,23 @@ OrbiSync는 **디바이스 신뢰를 최소화하고**,
 ```
 시간 →
 Arduino(Node)          Hub                     Web(UI)
-     |                  |                        |
+     |                   |                        |
      |--- HELLO -------->|                        |
      |<-- PENDING -------|                        |
      |--- POLL_SESSION ->|                        |
      |<-- PENDING -------|                        |
-     |                  |<--- GET pending list --|
-     |                  |---- pending list ----->|
-     |                  |<--- APPROVE(slot_id) --|
-     |                  | (Hub DB 상태 갱신)     |
+     |                   |<--- GET pending list --|
+     |                   |---- pending list ----->|
+     |                   |<--- APPROVE(slot_id) --|
+     |                   | (Hub DB 상태 갱신)       |
      |--- POLL_SESSION ->|                        |
      |<-- GRANTED -------|                        |
      |==== ACTIVE MODE ===========================|
-     |--- REQUEST(token)->|                        |
-     |<-- RESPONSE -------|                        |
-     |                  |                        |
-     | (TTL 만료/재부팅)  |                        |
-     |--- HELLO/POLL ---->|                        |
+     |--- REQUEST(token)->|                       |
+     |<-- RESPONSE -------|                       |
+     |                    |                       |
+     | (TTL 만료/재부팅)     |                       |
+     |--- HELLO/POLL ---->|                       |
 ```
 
 ### ACTIVE MODE
@@ -61,7 +60,7 @@ ACTIVE 상태에서는 **모든 요청에 session token이 포함**됩니다.
 
 ---
 
-## 📦 Requirements
+##  Requirements
 
 - ESP8266 또는 ESP32
 - ArduinoJson **>= 7.4.0**
@@ -69,7 +68,7 @@ ACTIVE 상태에서는 **모든 요청에 session token이 포함**됩니다.
 
 ---
 
-## 📥 Installation
+##  Installation
 
 ### Arduino Library Manager
 Arduino IDE → Library Manager → `OrbiSyncNode` 검색 후 설치
@@ -81,7 +80,7 @@ Arduino IDE → Library Manager → `OrbiSyncNode` 검색 후 설치
 
 ---
 
-## 🚀 Quick Start (Minimal Example)
+##  Quick Start (Minimal Example)
 
 > 이 예제는 **가장 최소한의 설정**만 보여줍니다.  
 > 고급 옵션은 `examples/reference/example`을 참고하세요.
@@ -121,7 +120,7 @@ void loop() {
 
 ---
 
-## 📚 Examples
+##  Examples
 
 - **`basic_smoke_test`**
   - WiFi 연결 + 기본 동작 확인용 최소 예제
@@ -132,7 +131,7 @@ void loop() {
 
 ---
 
-## 🔌 Hub API Interaction
+##  Hub API Interaction
 
 - `POST /api/device/hello`
 - `POST /api/device/session`
@@ -142,7 +141,7 @@ void loop() {
 
 ---
 
-## ⚠️ Notes & Design Philosophy
+##  Notes & Design Philosophy
 
 - 디바이스는 **절대 신뢰 대상이 아님**
 - 장기 토큰 / API Key를 펌웨어에 넣지 않음
@@ -151,13 +150,13 @@ void loop() {
 
 ---
 
-## 🧪 Supported Boards
+##  Supported Boards
 
 - ESP8266 (NodeMCU 등)
 - ESP32
 
 ---
 
-## 📄 License
+##  License
 
 MIT License
