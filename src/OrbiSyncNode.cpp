@@ -1,1867 +1,2082 @@
 /**
- * @file    OrbiSyncNode.cpp
- * @author  jihun kang
- * @date    2026-01-29
- * @brief   OrbiSyncNode 라이브러리의 핵심 구현
- *
+ * @file   OrbiSyncNode.cpp
+ * @brief  OrbiSync Hub 터널 클라이언트 구현
  * @details
- * 이 파일은 OrbiSyncNode 클래스의 모든 메서드를 구현합니다.
- * 상태 머신 실행, Hub와의 HTTP/HTTPS 통신, WebSocket 터널링,
- * 노드 등록, 이벤트 콜백 디스패치 등의 로직을 포함합니다.
- *
- * - 상태 머신 구현 (HELLO → PENDING_POLL → ACTIVE 전이 처리)
- * - Hub API 통신 (hello, session, heartbeat, commands, node registration)
- * - WebSocket 터널 연결 및 HTTP 요청/응답 멀티플렉싱
- * - 이벤트 콜백 디스패치 (상태 변경, 에러, 등록, 터널 연결)
- * - 지수 백오프를 통한 네트워크 오류 처리
- *
- * 본 코드는 OrbiSync 오픈소스 프로젝트의 일부입니다.
- * 라이선스 및 사용 조건은 LICENSE 파일을 참고하세요.
+ * - Hub API 호출 (hello/approve/session/register)
+ * - WebSocket 터널 연결 및 HTTP 요청 처리
+ * - 메모리 안정화: static 클라이언트 재사용, payload 직접 파싱
  */
+
+ #if defined(ESP8266)
+ #include <ESP8266WiFi.h>
+ #include <WiFiClient.h>
+ #include <WiFiClientSecureBearSSL.h>
+#elif defined(ESP32)
+ #include <WiFi.h>
+ #include <WiFiClient.h>
+ #include <WiFiClientSecure.h>
+#else
+ #error "Unsupported board"
+#endif
+
+#include <WebSocketsClient.h>
+#include <ArduinoJson.h>
+#include <string.h>
+#include <stdio.h>
 
 #include "OrbiSyncNode.h"
 
-#include <ArduinoJson.hpp>
-#include <cstring>
-#if defined(ESP32)
-#include <esp_system.h>
+// -----------------------------
+// Tunables
+// -----------------------------
+static constexpr uint32_t kBackoffMinMs = 1000;
+static constexpr uint32_t kBackoffMaxMs = 30000;
+
+static constexpr uint32_t kTunnelPingIntervalMs = 25000;
+static const uint32_t kTunnelBackoffMs[] = {1000, 2000, 5000, 10000, 30000};
+static constexpr uint8_t kTunnelBackoffSteps = 5;
+
+static constexpr size_t kDefaultMaxTunnelBody = 4096;
+
+// HTTPS fail → HTTP fallback (개발용)
+static uint8_t s_httpsFailCount = 0;
+static constexpr uint8_t MAX_HTTPS_FAIL_COUNT = 2;
+
+static char s_macBuf[24];
+
+// WebSocket globals
+static WebSocketsClient* s_wsClient = nullptr;
+static OrbiSyncNode::OrbiSyncNode* s_nodeForWs = nullptr;
+// Defer disconnect/delete to main loop; never delete inside WebSocket callback (prevents LoadProhibited).
+static bool s_tunnelDisconnectPending = false;
+
+// 터널 로그 rate limit (10초에 1회)
+static constexpr uint32_t kTunnelStatusLogIntervalMs = 10000;
+static uint32_t s_lastTunnelStatusLogMs = 0;
+static uint32_t s_lastTunnelSkipLogMs = 0;
+
+// tunnel_url에서 tunnel_id(서브도메인), tunnel_host 추출. buf_id/buf_host 최대 64바이트.
+static void parseTunnelUrlParts(const char* url, char* buf_id, size_t sz_id, char* buf_host, size_t sz_host) {
+  if (!url || !buf_id || sz_id == 0) return;
+  buf_id[0] = '\0';
+  if (buf_host && sz_host) buf_host[0] = '\0';
+  const char* hostStart = (strncmp(url, "wss://", 6) == 0) ? url + 6 : (strncmp(url, "ws://", 5) == 0) ? url + 5 : nullptr;
+  if (!hostStart) return;
+  const char* pathStart = strchr(hostStart, '/');
+  size_t hostLen = pathStart ? (size_t)(pathStart - hostStart) : strlen(hostStart);
+  if (hostLen == 0 || hostLen >= 128) return;
+  if (buf_host && sz_host > 0) {
+    size_t cp = hostLen < sz_host - 1 ? hostLen : sz_host - 1;
+    memcpy(buf_host, hostStart, cp);
+    buf_host[cp] = '\0';
+  }
+  const char* dot = strchr(hostStart, '.');
+  if (dot && dot > hostStart) {
+    size_t idLen = (size_t)(dot - hostStart);
+    if (idLen >= sz_id) idLen = sz_id - 1;
+    memcpy(buf_id, hostStart, idLen);
+    buf_id[idLen] = '\0';
+  } else {
+    size_t cp = hostLen < sz_id - 1 ? hostLen : sz_id - 1;
+    memcpy(buf_id, hostStart, cp);
+    buf_id[cp] = '\0';
+  }
+}
+
+// 응답 body preview (최대 200바이트, 제어문자 치환)
+static void logBodyPreview(const char* tag, const char* body, size_t len) {
+  constexpr size_t kMaxPreview = 200;
+  if (!body) return;
+  size_t pl = len;
+  if (pl > kMaxPreview) pl = kMaxPreview;
+  Serial.printf("[%s] response body_len=%u preview=", tag, (unsigned)len);
+  for (size_t i = 0; i < pl; i++) {
+    char c = body[i];
+    if (c == '\r' || c == '\n') Serial.print(' ');
+    else if (c >= 32 && c < 127) Serial.print(c);
+    else Serial.print('.');
+  }
+  if (len > kMaxPreview) Serial.print("...");
+  Serial.println();
+}
+
+// -----------------------------
+// Base64
+// -----------------------------
+static const char kBase64Chars[] =
+ "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static size_t base64Decode(uint8_t* out, const char* in, size_t inLen) {
+ size_t outLen = 0;
+ int val = 0, valb = -8;
+ for (size_t i = 0; i < inLen; i++) {
+   unsigned char c = (unsigned char)in[i];
+   int d = -1;
+   if (c >= 'A' && c <= 'Z') d = c - 'A';
+   else if (c >= 'a' && c <= 'z') d = c - 'a' + 26;
+   else if (c >= '0' && c <= '9') d = c - '0' + 52;
+   else if (c == '+') d = 62;
+   else if (c == '/') d = 63;
+   else if (c == '=') break;
+   else continue;
+
+   val = (val << 6) + d;
+   valb += 6;
+   if (valb >= 0) {
+     out[outLen++] = (uint8_t)((val >> valb) & 0xFF);
+     valb -= 8;
+   }
+ }
+ return outLen;
+}
+
+static size_t base64Encode(char* out, const uint8_t* in, size_t inLen) {
+ size_t i = 0, j = 0;
+ for (; i + 2 < inLen; i += 3) {
+   out[j++] = kBase64Chars[(in[i] >> 2) & 0x3F];
+   out[j++] = kBase64Chars[((in[i] & 0x03) << 4) | (in[i+1] >> 4)];
+   out[j++] = kBase64Chars[((in[i+1] & 0x0F) << 2) | (in[i+2] >> 6)];
+   out[j++] = kBase64Chars[in[i+2] & 0x3F];
+ }
+ if (i < inLen) {
+   out[j++] = kBase64Chars[(in[i] >> 2) & 0x3F];
+   if (i + 1 < inLen) {
+     out[j++] = kBase64Chars[((in[i] & 0x03) << 4) | (in[i+1] >> 4)];
+     out[j++] = kBase64Chars[((in[i+1] & 0x0F) << 2)];
+     out[j++] = '=';
+   } else {
+     out[j++] = kBase64Chars[(in[i] & 0x03) << 4];
+     out[j++] = '=';
+     out[j++] = '=';
+   }
+ }
+ out[j] = '\0';
+ return j;
+}
+
+// =============================
+// Namespace OrbiSyncNode
+// =============================
+namespace OrbiSyncNode {
+
+// -----------------------------
+// Helpers
+// -----------------------------
+static const char* stateStr(State s) {
+ switch (s) {
+   case State::BOOT: return "BOOT";
+   case State::HELLO: return "HELLO";
+   case State::PAIR_SUBMIT: return "PAIR_SUBMIT";
+   case State::PENDING_POLL: return "PENDING_POLL";
+   case State::GRANTED: return "GRANTED";
+   case State::ACTIVE: return "ACTIVE";
+   case State::TUNNEL_CONNECTING: return "TUNNEL_CONNECTING";
+   case State::TUNNEL_CONNECTED: return "TUNNEL_CONNECTED";
+   case State::ERROR: return "ERROR";
+   default: return "UNKNOWN";
+ }
+}
+
+// -----------------------------
+// TunnelHttpRequest::getHeader
+// -----------------------------
+const char* TunnelHttpRequest::getHeader(const char* key) const {
+ if (!key) return nullptr;
+ for (uint8_t i = 0; i < headerCount; i++) {
+   size_t j = 0;
+   while (key[j] && headers[i].key[j] && key[j] == headers[i].key[j]) j++;
+   if (key[j] == '\0' && headers[i].key[j] == '\0') return headers[i].value;
+ }
+ return nullptr;
+}
+
+// -----------------------------
+// TunnelHttpResponseWriter
+// -----------------------------
+TunnelHttpResponseWriter::TunnelHttpResponseWriter()
+ : node_(nullptr), statusCode_(200), headerCount_(0), bodyLen_(0), ended_(false) {
+ requestId_[0] = '\0';
+}
+
+void TunnelHttpResponseWriter::setStatus(int code) { statusCode_ = code; }
+
+void TunnelHttpResponseWriter::setHeader(const char* key, const char* value) {
+ if (!key || !value || headerCount_ >= TUNNEL_MAX_HEADERS) return;
+ strncpy(headers_[headerCount_].key, key, 23);
+ headers_[headerCount_].key[23] = '\0';
+ strncpy(headers_[headerCount_].value, value, 79);
+ headers_[headerCount_].value[79] = '\0';
+ headerCount_++;
+}
+
+void TunnelHttpResponseWriter::write(const uint8_t* data, size_t len) {
+ if (!data || ended_) return;
+ size_t remain = sizeof(body_) - bodyLen_;
+ if (len > remain) len = remain;
+ memcpy(body_ + bodyLen_, data, len);
+ bodyLen_ += len;
+}
+
+void TunnelHttpResponseWriter::write(const char* str) {
+ if (!str) return;
+ write((const uint8_t*)str, strlen(str));
+}
+
+void TunnelHttpResponseWriter::end() {
+ if (ended_) return;
+ ended_ = true;
+ if (node_) {
+   static_cast<OrbiSyncNode*>(node_)->tunnelSendProxyResponse(*this);
+ }
+}
+
+// -----------------------------
+// Config defaults helper
+// -----------------------------
+static uint32_t cfgOrDefaultU32(uint32_t v, uint32_t defv) { return v ? v : defv; }
+static size_t cfgOrDefaultSz(size_t v, size_t defv) { return v ? v : defv; }
+
+// -----------------------------
+// safePostJson (NO new/delete)
+// -----------------------------
+// - static TLS/plain client reuse
+// - header read: connected() 조건 제거 + first-byte wait
+// - timeout을 넉넉히(HELLO 단계에서 header read 늦게 오는 경우 방지)
+static bool safePostJson(
+ const Config& cfg,
+ const char* host,
+ uint16_t port,
+ bool useTls,
+ const char* path,
+ const char* jsonBody,
+ int* outStatus,
+ char* outBody,
+ size_t outBodyMax,
+ const char* logPrefix
+) {
+ if (!host || !path || !outStatus || !outBody || outBodyMax == 0) return false;
+ outBody[0] = '\0';
+ *outStatus = 0;
+
+ yield();
+
+ const uint32_t CONNECT_TIMEOUT_MS = 12000;
+ const uint32_t FIRST_BYTE_WAIT_MS = 3000;
+ const uint32_t HEADER_TIMEOUT_MS = 15000; // 핵심: 기존 8초는 짧아서 header 못 받는 케이스 많음
+ const uint32_t BODY_TIMEOUT_MS   = 15000;
+
+ // --- static clients ---
+#if defined(ESP8266)
+ static BearSSL::WiFiClientSecure s_tls;
+ static WiFiClient s_plain;
+ WiFiClient* c = nullptr;
+
+ if (useTls) {
+   // TLS 설정
+   if (cfg.allowInsecureTls) {
+     s_tls.setInsecure();
+   } else {
+     // rootCaPem을 쓰고 싶으면 여기서 setTrustAnchors로 넣어야 함(현재는 allowInsecureTls 권장)
+     s_tls.setInsecure(); // 현실적으로 CA 넣기 전까지는 insecure가 안정적
+   }
+   s_tls.setTimeout(CONNECT_TIMEOUT_MS / 1000);
+   s_tls.setNoDelay(true);
+   s_tls.setBufferSizes(512, 512);
+   s_tls.stop();
+
+   c = (WiFiClient*)&s_tls;
+ } else {
+   s_plain.setTimeout(CONNECT_TIMEOUT_MS / 1000);
+   s_plain.stop();
+   c = &s_plain;
+ }
+#elif defined(ESP32)
+ static WiFiClientSecure s_tls;
+ static WiFiClient s_plain;
+ WiFiClient* c = nullptr;
+
+ if (useTls) {
+   if (cfg.allowInsecureTls) s_tls.setInsecure();
+   else s_tls.setInsecure();
+   s_tls.setTimeout(CONNECT_TIMEOUT_MS / 1000);
+   s_tls.stop();
+   c = (WiFiClient*)&s_tls;
+ } else {
+   s_plain.setTimeout(CONNECT_TIMEOUT_MS / 1000);
+   s_plain.stop();
+   c = &s_plain;
+ }
 #endif
-#include <algorithm>
-#include <time.h>
 
-// ArduinoJson 7.x 네임스페이스 alias (cpp 파일에서도 사용)
-namespace AJ = ArduinoJson;
+ // connect
+ if (cfg.debugHttp) {
+   Serial.printf("[%s] connect try host=%s port=%u tls=%d\n", logPrefix, host, port, useTls ? 1 : 0);
+ }
 
-#define ORBI_SYNC_WS_DEBUG 0
+ uint32_t t0 = millis();
+ bool connected = c->connect(host, port);
+ uint32_t elapsed = millis() - t0;
 
-namespace {
-  constexpr uint32_t kDefaultPendingRetryMs = 3000;
-  constexpr uint32_t kInitialBackoffMs = 1000;
-  constexpr uint32_t kMaxBackoffMs = 30000;
+ if (!connected || elapsed > CONNECT_TIMEOUT_MS) {
+   if (cfg.debugHttp) {
+     Serial.printf("[%s] connect failed elapsed=%u\n", logPrefix, (unsigned)elapsed);
+   }
+   if (useTls) {
+     s_httpsFailCount++;
+     if (s_httpsFailCount >= MAX_HTTPS_FAIL_COUNT) {
+       if (cfg.debugHttp) Serial.printf("[%s] HTTPS failcount=%u -> fallback HTTP\n", logPrefix, s_httpsFailCount);
+       return safePostJson(cfg, host, 80, false, path, jsonBody, outStatus, outBody, outBodyMax, logPrefix);
+     }
+   }
+   c->stop();
+   return false;
+ }
 
-  // ✅ 정책 거절(슬롯 FULL 등) 시 너무 자주 두드리지 않도록 기본 대기값
-  constexpr uint32_t kDefaultRejectRetryMs = 60000; // 60초
+ // send request
+ size_t bodyLen = jsonBody ? strlen(jsonBody) : 0;
 
-  // ESP8266/ESP32에서 TLS(HTTPS) 첫 연결이 불안정할 때가 많아
-  // - NTP 시간 동기화 + (선택) 약간의 안정화 딜레이를 통해 실패(-1/-5)를 줄입니다.
-  static void syncTimeOnce() {
-    static bool done = false;
-    if (done) return;
+ // 작은 버퍼로 헤더 작성
+ char req[512];
+ int reqLen = snprintf(req, sizeof(req),
+   "POST %s HTTP/1.1\r\n"
+   "Host: %s\r\n"
+   "Content-Type: application/json\r\n"
+   "Content-Length: %u\r\n"
+   "Connection: close\r\n"
+   "\r\n",
+   path, host, (unsigned)bodyLen
+ );
+ if (reqLen <= 0 || (size_t)reqLen >= sizeof(req)) {
+   c->stop();
+   return false;
+ }
 
-    // UTC 기준(타임존은 로컬 표시만 영향, TLS 검증엔 epoch가 중요)
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+ if (c->write((const uint8_t*)req, (size_t)reqLen) != (size_t)reqLen) {
+   c->stop();
+   return false;
+ }
+ yield();
 
-    const uint32_t start = millis();
-    time_t now = time(nullptr);
-    // 1700000000 ~= 2023-11-14 (대략), 이보다 작으면 시간이 아직 1970년대일 가능성이 큼
-    while (now < 1700000000 && (millis() - start) < 10000) {
-      delay(200);
-      yield();  // 워치독 타이머 리셋 방지
-      now = time(nullptr);
-    }
+ if (bodyLen > 0) {
+   if (c->write((const uint8_t*)jsonBody, bodyLen) != bodyLen) {
+     c->stop();
+     return false;
+   }
+ }
+ yield();
 
-    Serial.printf("[TIME] epoch=%ld\n", (long)now);
-    done = true;
-  }
+ // ---- FIRST BYTE WAIT (중요) ----
+ uint32_t fb0 = millis();
+ while (!c->available() && (millis() - fb0) < FIRST_BYTE_WAIT_MS) {
+   delay(1);
+   yield();
+ }
 
-  // Stream을 감싸서 "최대 읽기 바이트"를 강제하는 래퍼
-  class CountingStream : public Stream {
-   public:
-    CountingStream(Stream& inner, size_t max_bytes)
-        : inner_(inner), max_bytes_(max_bytes) {}
+ // header read (connected() 조건 제거!)
+ uint32_t h0 = millis();
+ bool headerDone = false;
+ size_t headerBytes = 0;
+ size_t contentLength = 0;
 
-    bool overflow() const { return overflow_; }
-    size_t bytesRead() const { return bytes_read_; }
+ char line[256];
+ size_t lp = 0;
 
-    int available() override { return inner_.available(); }
+ while ((millis() - h0) < HEADER_TIMEOUT_MS && headerBytes < 2048) {
+   if (!c->available()) {
+     // 연결은 유지되는데 available이 늦는 경우가 있음
+     delay(1);
+     yield();
+     continue;
+   }
+   int ch = c->read();
+   if (ch < 0) { delay(1); yield(); continue; }
 
-    int read() override {
-      if (bytes_read_ >= max_bytes_) {
-        overflow_ = true;
-        return -1;
-      }
-      int c = inner_.read();
-      if (c >= 0) bytes_read_++;
-      return c;
-    }
+   headerBytes++;
+   if (ch == '\r') continue;
 
-    int peek() override {
-      if (bytes_read_ >= max_bytes_) {
-        overflow_ = true;
-        return -1;
-      }
-      return inner_.peek();
-    }
+   if (ch == '\n') {
+     line[lp] = '\0';
+     lp = 0;
 
-    void flush() override { inner_.flush(); }
+     if (line[0] == '\0') { // empty line => end header
+       headerDone = true;
+       break;
+     }
 
-    size_t write(uint8_t b) override { return inner_.write(b); }
+     if (strncmp(line, "HTTP/", 5) == 0) {
+       const char* sp = strchr(line, ' ');
+       if (sp) *outStatus = atoi(sp + 1);
+     }
 
-   private:
-    Stream& inner_;
-    size_t max_bytes_;
-    size_t bytes_read_ = 0;
-    bool overflow_ = false;
-  };
+     if (strncasecmp(line, "Content-Length:", 15) == 0) {
+       contentLength = (size_t)atoi(line + 15);
+     }
 
-  // ✅ 안전한 문자열 비교 유틸
-  static bool streq(const char* a, const char* b) {
-    if (!a || !b) return false;
-    return strcmp(a, b) == 0;
-  }
+     yield();
+     continue;
+   }
+
+   if (lp < sizeof(line) - 1) {
+     line[lp++] = (char)ch;
+   }
+
+   if ((headerBytes % 64) == 0) yield();
+ }
+
+ if (!headerDone) {
+   if (cfg.debugHttp) {
+     Serial.printf("[%s] header timeout (read=%u)\n", logPrefix, (unsigned)headerBytes);
+   }
+   c->stop();
+   return false;
+ }
+
+ // body read
+ uint32_t b0 = millis();
+ size_t total = 0;
+
+ while ((millis() - b0) < BODY_TIMEOUT_MS && total < outBodyMax - 1) {
+   if (!c->available()) {
+     // Content-Length가 있고 다 읽었으면 종료
+     if (contentLength > 0 && total >= contentLength) break;
+     // 연결이 끊겼고 더 없으면 종료
+     if (!c->connected()) break;
+     delay(1);
+     yield();
+     continue;
+   }
+
+   size_t toRead = outBodyMax - 1 - total;
+   if (toRead > 256) toRead = 256;
+   int r = c->read((uint8_t*)(outBody + total), toRead);
+   if (r > 0) total += (size_t)r;
+
+   if ((total % 128) == 0) yield();
+   if (contentLength > 0 && total >= contentLength) break;
+ }
+
+ outBody[total] = '\0';
+
+ if (useTls && total > 0 && *outStatus > 0) s_httpsFailCount = 0;
+
+ c->stop();
+ yield();
+
+ return (total > 0 && *outStatus > 0);
 }
 
-static OrbiSyncNode* s_ws_instance = nullptr;
+// -----------------------------
+// URL parse helper
+// -----------------------------
+struct ParsedBaseUrl {
+ char host[128];
+ uint16_t port;
+ bool useTls;
+ char basePath[128]; // optional
+};
 
-static void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
-  if (s_ws_instance) {
-    s_ws_instance->handleWsEvent(type, payload, length);
-  }
+static bool parseBaseUrl(const char* base, ParsedBaseUrl& out) {
+ if (!base || !base[0]) return false;
+
+ const char* p = base;
+ out.useTls = true;
+ out.port = 443;
+ out.basePath[0] = '\0';
+
+ if (strncmp(p, "https://", 8) == 0) { p += 8; out.useTls = true; out.port = 443; }
+ else if (strncmp(p, "http://", 7) == 0) { p += 7; out.useTls = false; out.port = 80; }
+ else { /* no scheme => https */ out.useTls = true; out.port = 443; }
+
+ const char* hostStart = p;
+ const char* portPos = strchr(hostStart, ':');
+ const char* pathPos = strchr(hostStart, '/');
+
+ size_t hostLen = 0;
+ if (portPos && (!pathPos || portPos < pathPos)) {
+   hostLen = (size_t)(portPos - hostStart);
+   out.port = (uint16_t)atoi(portPos + 1);
+ } else if (pathPos) {
+   hostLen = (size_t)(pathPos - hostStart);
+ } else {
+   hostLen = strlen(hostStart);
+ }
+
+ if (hostLen == 0 || hostLen >= sizeof(out.host)) return false;
+ memcpy(out.host, hostStart, hostLen);
+ out.host[hostLen] = '\0';
+
+ if (pathPos) {
+   strncpy(out.basePath, pathPos, sizeof(out.basePath) - 1);
+   out.basePath[sizeof(out.basePath) - 1] = '\0';
+   // strip trailing '/'
+   size_t L = strlen(out.basePath);
+   if (L > 1 && out.basePath[L - 1] == '/') out.basePath[L - 1] = '\0';
+ } else {
+   out.basePath[0] = '\0';
+ }
+
+ return true;
 }
 
+// 허브 통일 규칙: WS endpoint는 /ws/tunnel 로 고정.
+static bool buildWsTunnelUrl(const char* hubBaseUrl, char* outTunnelUrl, size_t urlSz) {
+ if (!hubBaseUrl || !hubBaseUrl[0] || !outTunnelUrl || urlSz < 32) return false;
+ ParsedBaseUrl u;
+ if (!parseBaseUrl(hubBaseUrl, u)) return false;
+ int n = snprintf(outTunnelUrl, urlSz, "wss://%s/ws/tunnel", u.host);
+ if (n <= 0 || (size_t)n >= urlSz) return false;
+ return true;
+}
+
+// DEBUG ONLY: full token logging (remove in production)
+static void logTokenPrefix(const char* tag, const char* token) {
+ if (!token || !token[0]) {
+   Serial.printf("[TUNNEL] %s (empty)\n", tag);
+   return;
+ }
+ size_t len = strlen(token);
+ Serial.printf("[TUNNEL] %s bearer_token=%s (len=%u)\n", tag, token, (unsigned)len);
+}
+
+static bool joinPath(const char* basePath, const char* path, char* out, size_t outSz) {
+ if (!out || outSz == 0 || !path) return false;
+ if (!basePath || !basePath[0]) {
+   strncpy(out, path, outSz - 1);
+   out[outSz - 1] = '\0';
+   return true;
+ }
+ // basePath + path
+ size_t a = strlen(basePath);
+ size_t b = strlen(path);
+ if (a + b + 1 >= outSz) return false;
+ strncpy(out, basePath, outSz - 1);
+ out[outSz - 1] = '\0';
+ strncat(out, path, outSz - strlen(out) - 1);
+ return true;
+}
+
+// -----------------------------
+// Constructor
+// -----------------------------
 OrbiSyncNode::OrbiSyncNode(const Config& config)
-  : config_(config),
-    state_(State::BOOT),
-    use_https_(strncmp(config.hubBaseUrl ? config.hubBaseUrl : "", "https", 5) == 0),
-    next_wifi_action_ms_(0),
-    next_net_action_ms_(0),
-    next_command_action_ms_(0),
-    wifi_backoff_ms_(kInitialBackoffMs),
-    net_backoff_ms_(kInitialBackoffMs),
-    register_backoff_ms_(config.registerRetryMs ? config.registerRetryMs : kInitialBackoffMs),
-    next_register_action_ms_(0),
-    session_expires_at_ms_(0),
-    last_heartbeat_ms_(0),
-    led_state_(false),
-    ws_backoff_ms_(kInitialBackoffMs),
-    next_ws_action_ms_(0),
-    ws_last_heartbeat_ms_(0),
-    ws_connected_(false),
-    ws_register_frame_sent_(false),
-    stream_open_(false),
-    request_handler_(nullptr),
-    state_change_callback_(nullptr),
-    error_callback_(nullptr),
-    register_callback_(nullptr),
-    tunnel_callback_(nullptr),
-    ws_connected_prev_(false),
-    state_prev_(State::BOOT) {
-  session_token_[0] = '\0';
-  last_error_[0] = '\0';
-  node_id_[0] = '\0';
-  node_auth_token_[0] = '\0';
-  tunnel_url_[0] = '\0';
-  active_stream_id_[0] = '\0';
-  request_buf_.reserve(1024);
-  is_registered_ = !config.enableNodeRegistration;
-  ws_extra_headers_.reserve(64);
-  machine_id_ptr_ = nullptr;
-  node_name_ptr_ = nullptr;
-  ensureIdentityInitialized();
-  // applyTlsPolicy(); // 생성자에서 제거 - 첫 네트워크 요청 전에 호출
-  if (config_.hubBaseUrl == nullptr || config_.slotId == nullptr) {
-    setLastError("설정 오류: hubBaseUrl 또는 slotId 누락");
-    transitionTo(State::ERROR);
-  }
-  randomSeed(ESP.getChipId() ^ micros());
-  s_ws_instance = this;
-  ws_client_.onEvent(webSocketEvent);
+ : cfg_(config),
+   state_(State::BOOT),
+   nextHelloMs_(0), nextPairMs_(0), nextApproveMs_(0), nextSessionPollMs_(0), nextRegisterBySlotMs_(0),
+   netBackoffMs_(kBackoffMinMs), pairBackoffMs_(kBackoffMinMs),
+   nextTunnelConnectMs_(0),
+   tunnelBackoffMs_(kTunnelBackoffMs[0]),
+   tunnelBackoffIndex_(0),
+   lastTunnelPingMs_(0),
+   tunnelRegistered_(false),
+   approveMissingMacFailed_(false),
+   lastHeartbeatMs_(0),
+   wifiConnecting_(false),
+   httpBusy_(false),
+   stateChangeCb_(nullptr),
+   errorCb_(nullptr),
+   registeredCb_(nullptr),
+   tunnelChangeCb_(nullptr),
+   requestHandler_(nullptr),
+   tunnelMessageCb_(nullptr),
+   httpRequestCb_(nullptr) {
+
+ nodeId_[0] = '\0';
+ nodeToken_[0] = '\0';
+ tunnelUrl_[0] = '\0';
+ tunnelId_[0] = '\0';
+ sessionToken_[0] = '\0';
+ pairingCode_[0] = '\0';
+ pairingExpiresAt_[0] = '\0';
+ pairingCodeValid_ = false;
 }
 
-OrbiSyncNode::~OrbiSyncNode() {
-  http_.end();
-  ws_client_.disconnect();
-  ws_client_.loop();
+// -----------------------------
+// WiFi
+// -----------------------------
+void OrbiSyncNode::beginWiFi(const char* ssid, const char* pass) {
+ WiFi.mode(WIFI_STA);
+ WiFi.begin(ssid, pass);
+ wifiConnecting_ = true;
+}
 
-#if defined(ESP8266)
-  if (ca_cert_ != nullptr) {
-    delete ca_cert_;
-    ca_cert_ = nullptr;
-  }
+void OrbiSyncNode::ensureWiFi() {
+ if (WiFi.status() == WL_CONNECTED) {
+   wifiConnecting_ = false;
+   return;
+ }
+ wifiConnecting_ = true;
+ yield();
+}
+
+// -----------------------------
+// State
+// -----------------------------
+void OrbiSyncNode::setState(State s) {
+ if (state_ == s) return;
+ State old = state_;
+ state_ = s;
+ Serial.printf("[STATE] %s -> %s\n", stateStr(old), stateStr(s));
+ if (s == State::ACTIVE && cfg_.enableTunnel) {
+   Serial.printf("[TUNNEL] ACTIVE entered tunnel_url_set=%d (next connect in %ums)\n",
+     tunnelUrl_[0] ? 1 : 0, (unsigned)nextTunnelConnectMs_);
+   if (tunnelUrl_[0]) nextTunnelConnectMs_ = 0;
+ }
+ if (stateChangeCb_) stateChangeCb_(old, s);
+}
+
+// -----------------------------
+// MAC / IDs
+// -----------------------------
+const char* OrbiSyncNode::getMacCStr() {
+ uint8_t mac[6];
+ WiFi.macAddress(mac);
+ snprintf(s_macBuf, sizeof(s_macBuf), "%02X:%02X:%02X:%02X:%02X:%02X",
+          mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+ return s_macBuf;
+}
+
+void OrbiSyncNode::getMachineId(char* buf, size_t size) {
+ if (!buf || size == 0) return;
+ const char* prefix = (cfg_.machineIdPrefix && cfg_.machineIdPrefix[0]) ? cfg_.machineIdPrefix : "node-";
+ const char* mac = getMacCStr();
+ snprintf(buf, size, "%s%s", prefix, mac ? mac : "");
+}
+
+uint32_t OrbiSyncNode::computeCapabilitiesHash() const {
+ uint32_t h = 0;
+ for (uint8_t i = 0; i < cfg_.capabilityCount && cfg_.capabilities; i++) {
+   const char* s = cfg_.capabilities[i];
+   if (!s) continue;
+   while (*s) h = h * 31 + (uint8_t)(*s++);
+ }
+ return h;
+}
+
+void OrbiSyncNode::getDeviceInfoJson(char* buf, size_t size) {
+ const char* mac = getMacCStr();
+ const char* mid = (cfg_.machineIdPrefix && cfg_.machineIdPrefix[0]) ? cfg_.machineIdPrefix : "node-";
+ const char* nn  = (cfg_.nodeNamePrefix && cfg_.nodeNamePrefix[0]) ? cfg_.nodeNamePrefix : "Node-";
+
+ snprintf(buf, size,
+   "{\"mac\":\"%s\",\"machine_id\":\"%s%s\",\"node_name\":\"%s%s\",\"platform\":\"esp\"}",
+   mac ? mac : "",
+   mid, mac ? mac : "",
+   nn, mac ? mac : ""
+ );
+}
+
+// -----------------------------
+// Pairing helpers
+// -----------------------------
+void OrbiSyncNode::clearPairingCode() {
+ pairingCode_[0] = '\0';
+ pairingExpiresAt_[0] = '\0';
+ pairingCodeValid_ = false;
+}
+
+void OrbiSyncNode::storePairingFromHello(const char* code, const char* expiresAt) {
+ pairingCodeValid_ = false;
+ if (!code || !code[0]) return;
+
+ size_t n = 0;
+ while (code[n] && n < kPairingCodeMax - 1) { pairingCode_[n] = code[n]; n++; }
+ pairingCode_[n] = '\0';
+
+ n = 0;
+ if (expiresAt) {
+   while (expiresAt[n] && n < sizeof(pairingExpiresAt_) - 1) {
+     pairingExpiresAt_[n] = expiresAt[n];
+     n++;
+   }
+ }
+ pairingExpiresAt_[n] = '\0';
+ pairingCodeValid_ = (pairingCode_[0] != '\0');
+}
+
+bool OrbiSyncNode::isPairingExpired() const {
+ // NTP 없는 MCU에서 expires_at 엄밀 비교는 의미가 적음 → 유효로 간주, 실패 시 폐기
+ if (!pairingCodeValid_) return true;
+ if (pairingExpiresAt_[0] == '\0') return false;
+ return false;
+}
+
+// -----------------------------
+// Backoff
+// -----------------------------
+void OrbiSyncNode::advanceNetBackoff() { netBackoffMs_ = (netBackoffMs_ < kBackoffMaxMs / 2) ? (netBackoffMs_ * 2) : kBackoffMaxMs; }
+void OrbiSyncNode::advancePairBackoff() { pairBackoffMs_ = (pairBackoffMs_ < kBackoffMaxMs / 2) ? (pairBackoffMs_ * 2) : kBackoffMaxMs; }
+void OrbiSyncNode::resetNetBackoff() { netBackoffMs_ = kBackoffMinMs; }
+void OrbiSyncNode::resetPairBackoff() { pairBackoffMs_ = kBackoffMinMs; }
+
+// -----------------------------
+// HTTP unified
+// -----------------------------
+bool OrbiSyncNode::postJsonUnified(const char* path, const char* body,
+                                  int* outStatus, char* outBody, size_t outBodyMax) {
+ if (!cfg_.hubBaseUrl || !path || !outStatus || !outBody || outBodyMax == 0) return false;
+
+ ParsedBaseUrl u;
+ if (!parseBaseUrl(cfg_.hubBaseUrl, u)) return false;
+
+ // full path = basePath + path
+ char fullPath[256];
+ if (!joinPath(u.basePath, path, fullPath, sizeof(fullPath))) return false;
+
+ bool useTls = u.useTls;
+ uint16_t port = u.port;
+
+ if (useTls && s_httpsFailCount >= MAX_HTTPS_FAIL_COUNT) {
+   useTls = false;
+   port = 80;
+   if (cfg_.debugHttp) Serial.printf("[HTTP] HTTPS failed %u times -> force HTTP\n", s_httpsFailCount);
+ }
+
+ return safePostJson(cfg_, u.host, port, useTls, fullPath, body, outStatus, outBody, outBodyMax, "HTTP");
+}
+
+// -----------------------------
+// HELLO
+// -----------------------------
+static char s_helloBuf[512];
+static char s_helloResp[1024];
+
+void OrbiSyncNode::tryHello() {
+ if (httpBusy_) return;
+ uint32_t now = millis();
+ if (now < nextHelloMs_) return;
+
+ StaticJsonDocument<384> doc;
+ doc["slot_id"] = cfg_.slotId ? cfg_.slotId : "";
+ doc["firmware"] = (cfg_.firmwareVersion && cfg_.firmwareVersion[0]) ? cfg_.firmwareVersion : "1.0.0";
+
+ char capHashStr[9];
+ snprintf(capHashStr, sizeof(capHashStr), "%08x", (unsigned)computeCapabilitiesHash());
+ doc["capabilities_hash"] = capHashStr;
+
+ char nonceStr[9];
+ snprintf(nonceStr, sizeof(nonceStr), "%08x", (unsigned)random(0x7FFFFFFF));
+ doc["nonce"] = nonceStr;
+
+ JsonObject di = doc.createNestedObject("device_info");
+ di["mac"] = getMacCStr();
+ di["platform"] = "esp";
+
+ size_t n = serializeJson(doc, s_helloBuf, sizeof(s_helloBuf));
+ if (n == 0 || n >= sizeof(s_helloBuf)) return;
+ s_helloBuf[n] = '\0';
+
+ httpBusy_ = true;
+ int status = 0;
+ s_helloResp[0] = '\0';
+ bool ok = postJsonUnified("/api/device/hello", s_helloBuf, &status, s_helloResp, sizeof(s_helloResp));
+ httpBusy_ = false;
+
+ yield();
+ handleHelloResponse(ok ? status : -1, s_helloResp, strlen(s_helloResp));
+}
+
+static void maskPairingForLog(const char* s, char* buf, size_t bufLen) {
+ if (!buf || bufLen == 0) return;
+ buf[0] = '\0';
+ if (!s) return;
+ size_t len = strlen(s);
+ if (len == 0) return;
+ if (len <= 2) { strncpy(buf, "**", bufLen - 1); buf[bufLen-1]='\0'; return; }
+ if (len == 3) { snprintf(buf, bufLen, "%.1s**", s); return; }
+ snprintf(buf, bufLen, "%.2s**%s", s, s + len - 2);
+}
+
+void OrbiSyncNode::handleHelloResponse(int status, const char* body, size_t len) {
+ if (status < 200 || status >= 300 || !body || len == 0) {
+   Serial.printf("[HELLO] fail status=%d\n", status);
+   advanceNetBackoff();
+   nextHelloMs_ = millis() + netBackoffMs_;
+   return;
+ }
+
+ StaticJsonDocument<512> doc;
+ size_t parseLen = (len > 768) ? 768 : len; // 너무 길면 일부만 파싱
+ DeserializationError err = deserializeJson(doc, body, parseLen);
+ if (err) {
+   Serial.printf("[HELLO] parse err (len=%u)\n", (unsigned)len);
+   advanceNetBackoff();
+   nextHelloMs_ = millis() + netBackoffMs_;
+   return;
+ }
+
+ const char* st = doc["status"] | "";
+ int retryMs = doc["retry_after_ms"] | 3000;
+
+ if (strcmp(st, "DENIED") == 0) {
+   Serial.println("[HELLO] DENIED");
+   setState(State::ERROR);
+   if (errorCb_) errorCb_("HELLO denied");
+   nextHelloMs_ = millis() + (uint32_t)retryMs;
+   return;
+ }
+
+ // pairing key variants
+ const char* pc = nullptr;
+ const char* usedKey = "";
+ if (doc["pairing_code"].is<const char*>()) { pc = doc["pairing_code"]; usedKey = "pairing_code"; }
+ else if (doc["pairing"].is<const char*>()) { pc = doc["pairing"]; usedKey = "pairing"; }
+ else if (doc["code"].is<const char*>()) { pc = doc["code"]; usedKey = "code"; }
+ if (!pc) pc = "";
+
+ const char* exp = doc["pairing_expires_at"] | doc["expires_at"] | "";
+
+ if (pc[0]) {
+   storePairingFromHello(pc, exp);
+   char masked[16]; maskPairingForLog(pc, masked, sizeof(masked));
+   Serial.printf("[HELLO] pairing key=%s value=%s expires=%s\n", usedKey, masked, (exp && exp[0]) ? exp : "(none)");
+ } else {
+   clearPairingCode();
+   Serial.println("[HELLO] no pairing_code (pending)");
+ }
+
+ resetNetBackoff();
+ nextHelloMs_ = millis() + (uint32_t)retryMs;
+ nextSessionPollMs_ = millis() + (uint32_t)retryMs;
+ nextApproveMs_ = millis() + 500;
+ nextPairMs_ = millis() + 500;
+
+ if (pairingCodeValid_) {
+   if (cfg_.enableSelfApprove && cfg_.approveEndpointPath && cfg_.approveEndpointPath[0]) {
+     setState(State::PENDING_POLL);
+   } else {
+     setState(State::PAIR_SUBMIT);
+   }
+ } else {
+   setState(State::HELLO);
+ }
+}
+
+// -----------------------------
+// PAIR
+// -----------------------------
+bool OrbiSyncNode::postDevicePair(const char* code, int* outStatus,
+                                 char* outBody, size_t outBodyMax) {
+ StaticJsonDocument<512> doc;
+ doc["slot_id"] = cfg_.slotId ? cfg_.slotId : "";
+ doc["pairing_code"] = code ? code : "";
+ doc["firmware"] = (cfg_.firmwareVersion && cfg_.firmwareVersion[0]) ? cfg_.firmwareVersion : "1.0.0";
+ JsonObject di = doc.createNestedObject("device_info");
+ di["mac"] = getMacCStr();
+ di["platform"] = "esp";
+
+ char buf[512];
+ size_t n = serializeJson(doc, buf, sizeof(buf));
+ if (n == 0 || n >= sizeof(buf)) return false;
+ buf[n] = '\0';
+
+ return postJsonUnified("/api/device/pair", buf, outStatus, outBody, outBodyMax);
+}
+
+void OrbiSyncNode::tryPairIfNeeded() {
+ if (!pairingCodeValid_ || !pairingCode_[0]) return;
+ if (httpBusy_) return;
+ uint32_t now = millis();
+ if (now < nextPairMs_) return;
+
+ if (isPairingExpired()) {
+   clearPairingCode();
+   setState(State::HELLO);
+   nextHelloMs_ = millis() + 1000;
+   return;
+ }
+
+ httpBusy_ = true;
+ int status = 0;
+ char resp[1024];
+ resp[0] = '\0';
+ bool ok = postDevicePair(pairingCode_, &status, resp, sizeof(resp));
+ httpBusy_ = false;
+
+ yield();
+
+ if (!ok || status < 200 || status >= 300) {
+   Serial.printf("[PAIR] fail status=%d\n", status);
+   clearPairingCode();
+   advancePairBackoff();
+   setState(State::HELLO);
+   nextHelloMs_ = millis() + pairBackoffMs_;
+   return;
+ }
+
+ StaticJsonDocument<1024> doc;
+ if (deserializeJson(doc, resp)) {
+   Serial.println("[PAIR] parse err");
+   clearPairingCode();
+   setState(State::HELLO);
+   nextHelloMs_ = millis() + 3000;
+   return;
+ }
+
+ bool success = doc["ok"] | false;
+ if (!success) {
+   Serial.println("[PAIR] ok=false");
+   clearPairingCode();
+   advancePairBackoff();
+   setState(State::HELLO);
+   nextHelloMs_ = millis() + pairBackoffMs_;
+   return;
+ }
+
+ const char* nid = doc["node_id"] | doc["canonical_node_id"] | doc["resolved_node_id"] | "";
+ const char* stok = doc["session_token"] | "";
+ const char* ntok = doc["node_token"] | "";
+ const char* tun  = doc["tunnel_url"] | "";
+
+ if (nid[0]) {
+   strncpy(nodeId_, nid, sizeof(nodeId_) - 1);
+   nodeId_[sizeof(nodeId_) - 1] = '\0';
+   Serial.printf("[PAIR] canonical node_id=%s (from hub)\n", nodeId_);
+ }
+ if (stok[0]) { strncpy(sessionToken_, stok, sizeof(sessionToken_) - 1); sessionToken_[sizeof(sessionToken_) - 1] = '\0'; }
+ if (ntok[0]) { strncpy(nodeToken_, ntok, sizeof(nodeToken_) - 1); nodeToken_[sizeof(nodeToken_) - 1] = '\0'; }
+ if (cfg_.hubBaseUrl && buildWsTunnelUrl(cfg_.hubBaseUrl, tunnelUrl_, sizeof(tunnelUrl_))) {
+   nextTunnelConnectMs_ = 0;
+   Serial.printf("[TUNNEL] from pair ws_url=%s\n", tunnelUrl_);
+ } else if (tun[0]) {
+   // (레거시) 서버가 tunnel_url을 내려주는 경우
+   strncpy(tunnelUrl_, tun, sizeof(tunnelUrl_) - 1);
+   tunnelUrl_[sizeof(tunnelUrl_) - 1] = '\0';
+   nextTunnelConnectMs_ = 0;
+   Serial.printf("[TUNNEL] from pair legacy tunnel_url=%s\n", tunnelUrl_);
+ }
+
+ resetPairBackoff();
+ clearPairingCode();
+
+ Serial.println("[PAIR] ok -> ACTIVE");
+ if (registeredCb_) registeredCb_(nodeId_[0] ? nodeId_ : "");
+ setState(State::ACTIVE);
+ lastHeartbeatMs_ = millis();
+ nextSessionPollMs_ = millis() + 60000;
+}
+
+// -----------------------------
+// APPROVE (self-approve)
+// ---- Hub 승인 API 호출 ----
+static char s_approveBuf[512];
+static char s_approveResp[2048];
+
+/// Hub에 approve 요청 전송 (세션 토큰 획득)
+void OrbiSyncNode::tryApprove() {
+ if (httpBusy_ || approveMissingMacFailed_) return;
+ if (!cfg_.approveEndpointPath || !cfg_.approveEndpointPath[0]) return;
+
+ uint32_t now = millis();
+ if (now < nextApproveMs_) return;
+
+ if (!pairingCodeValid_ || !pairingCode_[0]) {
+   nextApproveMs_ = millis() + cfgOrDefaultU32(cfg_.approveRetryMs, 3000);
+   return;
+ }
+
+ const char* mac = getMacCStr();
+ if (!mac || !mac[0]) {
+   if (errorCb_) errorCb_("approve: MAC unavailable");
+   approveMissingMacFailed_ = true;
+   return;
+ }
+
+ char machineId[80];
+ getMachineId(machineId, sizeof(machineId));
+
+ const char* fw = (cfg_.firmwareVersion && cfg_.firmwareVersion[0]) ? cfg_.firmwareVersion : "1.0.0";
+
+ int n = snprintf(s_approveBuf, sizeof(s_approveBuf),
+   "{\"slot_id\":\"%s\",\"pairing_code\":\"%s\",\"mac\":\"%s\",\"machine_id\":\"%s\",\"firmware\":\"%s\"}",
+   cfg_.slotId ? cfg_.slotId : "",
+   pairingCode_,
+   mac,
+   machineId,
+   fw
+ );
+ if (n <= 0 || (size_t)n >= sizeof(s_approveBuf)) {
+   nextApproveMs_ = millis() + 3000;
+   return;
+ }
+
+ Serial.printf("[TUNNEL] request: method=POST path=%s body_len=%u\n", cfg_.approveEndpointPath ? cfg_.approveEndpointPath : "", (unsigned)n);
+
+ // approve는 postJsonUnified를 쓰되 path만 approveEndpointPath로
+ httpBusy_ = true;
+ int status = 0;
+ s_approveResp[0] = '\0';
+
+ bool ok = postJsonUnified(cfg_.approveEndpointPath, s_approveBuf, &status, s_approveResp, sizeof(s_approveResp));
+ httpBusy_ = false;
+
+ yield();
+
+ size_t respLen = strlen(s_approveResp);
+ Serial.printf("[TUNNEL] response: status=%d body_len=%u\n", status, (unsigned)respLen);
+ if (respLen > 0) logBodyPreview("APPROVE", s_approveResp, respLen);
+
+ if (!ok) {
+   Serial.println("[APPROVE] fail (timeout or connect)");
+   advanceNetBackoff();
+   nextApproveMs_ = millis() + cfgOrDefaultU32(cfg_.approveRetryMs, 3000);
+   return;
+ }
+
+ if (status == 400 && strstr(s_approveResp, "missing_mac")) {
+   Serial.println("[APPROVE] 400 missing_mac -> stop retry");
+   if (errorCb_) errorCb_("approve: missing_mac");
+   approveMissingMacFailed_ = true;
+   return;
+ }
+
+ if (status < 200 || status >= 300) {
+   Serial.printf("[APPROVE] fail http status=%d\n", status);
+   nextApproveMs_ = millis() + cfgOrDefaultU32(cfg_.approveRetryMs, 3000);
+   return;
+ }
+
+ StaticJsonDocument<1536> doc;
+ if (deserializeJson(doc, s_approveResp)) {
+   Serial.println("[APPROVE] parse err");
+   nextApproveMs_ = millis() + 3000;
+   return;
+ }
+
+ const char* st = doc["status"] | "";
+ const char* tok = doc["session_token"] | "";
+ const char* ntok = doc["register_token"] | doc["node_token"] | "";
+ const char* tun = doc["tunnel_url"] | "";
+ const char* nid = doc["node_id"] | doc["canonical_node_id"] | doc["resolved_node_id"] | "";
+
+ if (tok && tok[0]) {
+   strncpy(sessionToken_, tok, sizeof(sessionToken_) - 1);
+   sessionToken_[sizeof(sessionToken_) - 1] = '\0';
+ }
+ if (ntok && ntok[0]) {
+   strncpy(nodeToken_, ntok, sizeof(nodeToken_) - 1);
+   nodeToken_[sizeof(nodeToken_) - 1] = '\0';
+ }
+ if (nid && nid[0]) {
+   strncpy(nodeId_, nid, sizeof(nodeId_) - 1);
+   nodeId_[sizeof(nodeId_) - 1] = '\0';
+   Serial.printf("[APPROVE] canonical node_id=%s (from hub)\n", nodeId_);
+ }
+ if (tok && tok[0] && cfg_.hubBaseUrl && buildWsTunnelUrl(cfg_.hubBaseUrl, tunnelUrl_, sizeof(tunnelUrl_))) {
+   nextTunnelConnectMs_ = 0;
+   Serial.printf("[TUNNEL] from approve ws_url=%s\n", tunnelUrl_);
+ } else if (tun && tun[0]) {
+   // (레거시) 서버가 tunnel_url을 내려주는 경우
+   strncpy(tunnelUrl_, tun, sizeof(tunnelUrl_) - 1);
+   tunnelUrl_[sizeof(tunnelUrl_) - 1] = '\0';
+   nextTunnelConnectMs_ = 0;
+ }
+
+ resetNetBackoff();
+ approveMissingMacFailed_ = false;
+
+ if (registeredCb_) registeredCb_(nodeId_[0] ? nodeId_ : "");
+ setState(State::ACTIVE);
+ lastHeartbeatMs_ = millis();
+ nextSessionPollMs_ = millis() + 60000;
+}
+
+// ---- 세션 폴링 ----
+/// Hub에 session 폴링 요청 (PENDING → GRANTED 대기)
+void OrbiSyncNode::trySessionPoll() {
+ if (httpBusy_) return;
+ uint32_t now = millis();
+ if (now < nextSessionPollMs_) return;
+
+ const char* path = (cfg_.sessionEndpointPath && cfg_.sessionEndpointPath[0]) ? cfg_.sessionEndpointPath : "/api/device/session";
+
+ StaticJsonDocument<256> doc;
+ doc["slot_id"] = cfg_.slotId ? cfg_.slotId : "";
+ char nonceStr[9];
+ snprintf(nonceStr, sizeof(nonceStr), "%08x", (unsigned)random(0x7FFFFFFF));
+ doc["nonce"] = nonceStr;
+
+ char buf[256];
+ size_t n = serializeJson(doc, buf, sizeof(buf));
+ if (n == 0 || n >= sizeof(buf)) return;
+ buf[n] = '\0';
+
+ Serial.printf("[TUNNEL] request: method=POST path=%s body_len=%u\n", path, (unsigned)n);
+ httpBusy_ = true;
+ int status = 0;
+ char resp[1024];
+ resp[0] = '\0';
+ bool ok = postJsonUnified(path, buf, &status, resp, sizeof(resp));
+ httpBusy_ = false;
+
+ yield();
+
+ size_t rl = strlen(resp);
+ Serial.printf("[TUNNEL] response: status=%d body_len=%u\n", status, (unsigned)rl);
+ if (rl > 0) logBodyPreview("SESSION", resp, rl);
+
+ if (!ok) {
+   Serial.println("[SESSION] fail (timeout or connect)");
+   advanceNetBackoff();
+   nextSessionPollMs_ = millis() + netBackoffMs_;
+   return;
+ }
+
+ if (status == 404) {
+   Serial.printf("[SESSION] fail http 404 path=%s\n", path);
+   nextSessionPollMs_ = millis() + 5000;
+   return;
+ }
+
+ StaticJsonDocument<512> r;
+ size_t pl = (rl > 512) ? 512 : rl;
+ if (deserializeJson(r, resp, pl)) {
+   Serial.println("[SESSION] fail json parse");
+   nextSessionPollMs_ = millis() + 3000;
+   return;
+ }
+
+ const char* st = r["status"] | "";
+ int retryMs = r["retry_after_ms"] | 3000;
+
+ if (strcmp(st, "GRANTED") == 0) {
+   const char* tok = r["session_token"] | "";
+   const char* tun = r["tunnel_url"] | "";
+   if (tok[0]) { strncpy(sessionToken_, tok, sizeof(sessionToken_) - 1); sessionToken_[sizeof(sessionToken_) - 1] = '\0'; }
+   if (tok[0] && cfg_.hubBaseUrl && buildWsTunnelUrl(cfg_.hubBaseUrl, tunnelUrl_, sizeof(tunnelUrl_))) {
+     nextTunnelConnectMs_ = 0;
+     Serial.printf("[TUNNEL] from session ws_url=%s\n", tunnelUrl_);
+   } else if (tun[0]) {
+     // (레거시)
+     strncpy(tunnelUrl_, tun, sizeof(tunnelUrl_) - 1);
+     tunnelUrl_[sizeof(tunnelUrl_) - 1] = '\0';
+     nextTunnelConnectMs_ = 0;
+   }
+   resetNetBackoff();
+   setState(State::ACTIVE);
+   lastHeartbeatMs_ = millis();
+ } else if (strcmp(st, "DENIED") == 0) {
+   setState(State::ERROR);
+   if (errorCb_) errorCb_("Session denied");
+ }
+
+ nextSessionPollMs_ = millis() + (uint32_t)retryMs;
+}
+
+// -----------------------------
+// register_by_slot
+// -----------------------------
+void OrbiSyncNode::tryRegisterBySlot() {
+ if (!cfg_.preferRegisterBySlot || !cfg_.loginToken || !cfg_.loginToken[0]) return;
+ if (httpBusy_) return;
+
+ uint32_t now = millis();
+ if (now < nextRegisterBySlotMs_) return;
+
+ char machineId[80];
+ getMachineId(machineId, sizeof(machineId));
+
+ StaticJsonDocument<384> doc;
+ doc["slot_id"] = cfg_.slotId ? cfg_.slotId : "";
+ doc["login_token"] = cfg_.loginToken;
+ doc["machine_id"] = machineId;
+ doc["platform"] = "esp";
+ if (cfg_.firmwareVersion && cfg_.firmwareVersion[0]) doc["agent_version"] = cfg_.firmwareVersion;
+
+ char buf[384];
+ size_t n = serializeJson(doc, buf, sizeof(buf));
+ if (n == 0 || n >= sizeof(buf)) return;
+ buf[n] = '\0';
+
+ Serial.printf("[TUNNEL] request: method=POST path=/api/nodes/register_by_slot body_len=%u\n", (unsigned)n);
+ httpBusy_ = true;
+ int status = 0;
+ char resp[1024];
+ resp[0] = '\0';
+ bool ok = postJsonUnified("/api/nodes/register_by_slot", buf, &status, resp, sizeof(resp));
+ httpBusy_ = false;
+
+ yield();
+
+ nextRegisterBySlotMs_ = now + cfgOrDefaultU32(cfg_.registerRetryMs, 4000);
+
+ size_t rl = strlen(resp);
+ Serial.printf("[TUNNEL] response: status=%d body_len=%u\n", status, (unsigned)rl);
+ if (rl > 0) logBodyPreview("REG_SLOT", resp, rl);
+
+ if (!ok) {
+   Serial.println("[REG_SLOT] fail (timeout or connect)");
+   return;
+ }
+ if (status < 200 || status >= 300) {
+   Serial.printf("[REG_SLOT] fail http status=%d\n", status);
+   return;
+ }
+
+ StaticJsonDocument<512> r;
+ if (deserializeJson(r, resp)) {
+   Serial.println("[REG_SLOT] fail json parse");
+   return;
+ }
+
+ const char* nid = r["node_id"] | "";
+ const char* authTok = r["node_auth_token"] | "";
+ const char* tun = r["tunnel_url"] | "";
+ if (!nid[0] || !authTok[0] || !tun[0]) {
+   Serial.println("[REG_SLOT] fail missing fields");
+   return;
+ }
+
+ strncpy(nodeId_, nid, sizeof(nodeId_) - 1);
+ nodeId_[sizeof(nodeId_) - 1] = '\0';
+ strncpy(nodeToken_, authTok, sizeof(nodeToken_) - 1);
+ nodeToken_[sizeof(nodeToken_) - 1] = '\0';
+ strncpy(tunnelUrl_, tun, sizeof(tunnelUrl_) - 1);
+ tunnelUrl_[sizeof(tunnelUrl_) - 1] = '\0';
+
+ char tid[64], thost[64];
+ parseTunnelUrlParts(tunnelUrl_, tid, sizeof(tid), thost, sizeof(thost));
+ Serial.printf("[TUNNEL] from register_by_slot tunnel_url=%s tunnel_id=%s tunnel_host=%s node=%s\n", tunnelUrl_, tid, thost, nodeId_);
+ nextTunnelConnectMs_ = 0;
+ tunnelBackoffIndex_ = 0;
+ tunnelBackoffMs_ = kTunnelBackoffMs[0];
+
+ if (registeredCb_) registeredCb_(nodeId_);
+ setState(State::ACTIVE);
+ lastHeartbeatMs_ = millis();
+}
+
+// -----------------------------
+// Heartbeat (단편화 방지: String 금지)
+// -----------------------------
+void OrbiSyncNode::tryHeartbeat() {
+ if (!sessionToken_[0]) return;
+ if (httpBusy_) return;
+
+ uint32_t now = millis();
+ if (now - lastHeartbeatMs_ < cfgOrDefaultU32(cfg_.heartbeatIntervalMs, 60000)) return;
+
+ StaticJsonDocument<256> doc;
+ doc["slot_id"] = cfg_.slotId ? cfg_.slotId : "";
+ char nonceStr[9];
+ snprintf(nonceStr, sizeof(nonceStr), "%08x", (unsigned)random(0x7FFFFFFF));
+ doc["nonce"] = nonceStr;
+ doc["firmware"] = (cfg_.firmwareVersion && cfg_.firmwareVersion[0]) ? cfg_.firmwareVersion : "1.0.0";
+ doc["uptime_ms"] = (unsigned long)now;
+#if defined(ESP8266) || defined(ESP32)
+ doc["free_heap"] = ESP.getFreeHeap();
+ doc["rssi"] = WiFi.RSSI();
 #endif
+ char capHashStr[9];
+ snprintf(capHashStr, sizeof(capHashStr), "%08x", (unsigned)computeCapabilitiesHash());
+ doc["capabilities_hash"] = capHashStr;
+
+ char buf[256];
+ size_t n = serializeJson(doc, buf, sizeof(buf));
+ if (n == 0 || n >= sizeof(buf)) return;
+ buf[n] = '\0';
+
+ // Authorization 헤더는 safePostJson에서 처리하지 않으므로(간소화),
+ // 여기서는 heartbeat를 생략하거나, 별도 구현이 필요.
+ // 지금 안정화 목표는 "HELLO/APPROVE/SESSION/터널"이라 heartbeat는 기본 OFF를 권장.
+ // 필요하면 이후 "Authorization: Bearer" 포함 POST를 별도로 추가하자.
+ lastHeartbeatMs_ = now;
 }
 
-bool OrbiSyncNode::beginWiFi(const char* ssid, const char* pass) {
-  WiFi.mode(WIFI_STA);
-  wifi_ssid_ = ssid;
-  wifi_password_ = pass;
-  wifi_backoff_ms_ = kInitialBackoffMs;
-  next_wifi_action_ms_ = 0;
-  return ensureWiFi();
-}
+// -----------------------------
+// State machine
+// -----------------------------
+void OrbiSyncNode::runStateMachine() {
+ yield();
+ ensureWiFi();
+ if (WiFi.status() != WL_CONNECTED) return;
 
-/**
- * @brief Wi-Fi 연결 상태를 확인하고 필요 시 재연결을 시도한다.
- *
- * @details
- * - 이미 Wi-Fi가 연결되어 있으면 즉시 true를 반환한다.
- * - 아직 재시도 시간이 되지 않았다면 아무 동작 없이 false를 반환한다.
- * - SSID 또는 비밀번호가 비어 있으면 에러를 기록하고 백오프를 설정한다.
- * - 재연결이 가능한 시점이면 WiFi.begin()을 호출해 연결을 시도한다.
- *
- * @return
- *  - true  : Wi-Fi가 이미 연결된 상태
- *  - false : 아직 연결되지 않았거나 재시도 대기 중
- */
-bool OrbiSyncNode::ensureWiFi() {
+ switch (state_) {
+   case State::BOOT:
+     setState(State::HELLO);
+     nextHelloMs_ = millis();
+     break;
 
-  // 이미 Wi-Fi가 연결되어 있다면
-  if (WiFi.status() == WL_CONNECTED) {
-    // 재연결 실패 상태를 정상 상태로 되돌리기 위해 백오프 시간을 초기값으로 리셋
-    wifi_backoff_ms_ = kInitialBackoffMs;
-    return true;
-  }
+   case State::HELLO:
+     tryHello();
+     break;
 
-  // 현재 시간(ms 단위) 확인
-  uint32_t now = millis();
+   case State::PAIR_SUBMIT:
+     tryPairIfNeeded();
+     break;
 
-  // 아직 다음 Wi-Fi 동작 시점이 아니라면 아무것도 하지 않음
-  if (now < next_wifi_action_ms_) {
-    return false;
-  }
+   case State::PENDING_POLL: {
+     if (cfg_.preferRegisterBySlot && cfg_.loginToken && cfg_.loginToken[0]) {
+       tryRegisterBySlot();
+     }
+     if (cfg_.enableSelfApprove && cfg_.approveEndpointPath && cfg_.approveEndpointPath[0] &&
+         !sessionToken_[0] && !approveMissingMacFailed_) {
+       tryApprove();
+     }
+     if (!sessionToken_[0]) {
+       trySessionPoll();
+     }
+     break;
+   }
 
-  // SSID 또는 비밀번호가 설정되지 않은 경우
-  if (wifi_ssid_.isEmpty() || wifi_password_.isEmpty()) {
-    // 마지막 에러 메시지 기록
-    setLastError("Wi-Fi 인증 정보 부족");
+   case State::GRANTED:
+     setState(State::ACTIVE);
+     lastHeartbeatMs_ = millis();
+     break;
 
-    // 초기 백오프 시간 후에 다시 시도하도록 예약
-    scheduleNextWiFi(kInitialBackoffMs);
-    return false;
-  }
+   case State::ACTIVE:
+   case State::TUNNEL_CONNECTING:
+   case State::TUNNEL_CONNECTED:
+     tunnelLoop();
+     // tryHeartbeat(); // 필요하면 켜기
+     break;
 
-  // Wi-Fi 연결 시도
-  // (비동기 방식이며, 실제 연결 여부는 다음 루프에서 확인됨)
-  WiFi.begin(wifi_ssid_.c_str(), wifi_password_.c_str());
+   case State::ERROR:
+     nextHelloMs_ = millis() + netBackoffMs_;
+     setState(State::HELLO);
+     break;
 
-  // 즉시 다음 루프에서 상태를 다시 확인할 수 있도록 예약
-  scheduleNextWiFi(0);
+   default:
+     break;
+ }
 
-  // 아직 연결되지 않았으므로 false 반환
-  return false;
-}
-
-bool OrbiSyncNode::applyTlsPolicy() {
-  if (!use_https_) return true;
-
-  // HTTPS 첫 연결 안정화: 시간 동기화(1회) 후 TLS 설정
-  syncTimeOnce();
-
+ // (선택) 5초마다 힙 단편화 진단
 #if defined(ESP8266)
-  // ESP8266(BearSSL)
-  if (config_.allowInsecureTls || config_.rootCaPem == nullptr) {
-    if (!config_.allowInsecureTls && config_.rootCaPem == nullptr) {
-      Serial.println("[TLS] rootCaPem 없음 -> setInsecure()로 폴백 (권장: CA 설정)");
-    }
-    secure_client_.setInsecure();
-    return true;
-  }
-
-  // CA가 바뀌었으면 갱신
-  if (ca_cert_ == nullptr || last_root_ca_pem_ != config_.rootCaPem) {
-    if (ca_cert_ != nullptr) {
-      delete ca_cert_;
-      ca_cert_ = nullptr;
-    }
-    ca_cert_ = new BearSSL::X509List(config_.rootCaPem);
-    last_root_ca_pem_ = config_.rootCaPem;
-  }
-
-  secure_client_.setTrustAnchors(ca_cert_);
-  return true;
-
-#else
-  // ESP32(WiFiClientSecure)
-  if (config_.allowInsecureTls || config_.rootCaPem == nullptr) {
-    if (!config_.allowInsecureTls && config_.rootCaPem == nullptr) {
-      Serial.println("[TLS] rootCaPem 없음 -> setInsecure()로 폴백 (권장: CA 설정)");
-    }
-    secure_client_.setInsecure();
-    return true;
-  }
-
-  secure_client_.setCACert(config_.rootCaPem);
-  return true;
+ static uint32_t lastDiag = 0;
+ if (millis() - lastDiag > 5000) {
+   lastDiag = millis();
+   Serial.printf("[DIAG] heap=%u maxblk=%u frag=%u%% state=%s\n",
+     ESP.getFreeHeap(),
+     ESP.getMaxFreeBlockSize(),
+     ESP.getHeapFragmentation(),
+     stateStr(state_)
+   );
+ }
 #endif
-}
-
-bool OrbiSyncNode::sendHello() {
-  Serial.println("\n================ HELLO BEGIN ================");
-
-  if (state_ == State::ERROR) {
-    Serial.println("[HELLO] state=ERROR -> skip");
-    return false;
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[HELLO] WiFi disconnected");
-    setLastError("HELLO 전 Wi-Fi 끊김");
-    scheduleNextNetwork();
-    return false;
-  }
-
-  String url = String(config_.hubBaseUrl) + "/api/device/hello";
-  Serial.printf("[HELLO] URL: %s\n", url.c_str());
-
-  // ✅ TLS/소켓 옵션은 begin 전에!
-  if (use_https_) {
-    if (!applyTlsPolicy()) {
-      Serial.println("[HELLO] TLS 정책 적용 실패");
-      setLastError("TLS 정책 적용 실패");
-      scheduleNextNetwork();
-      return false;
-    }
-    secure_client_.setTimeout(15000);
-  } else {
-    insecure_client_.setTimeout(15000);
-  }
-
-  // ✅ begin은 분기해서 명확히
-  bool ok = false;
-  if (use_https_) ok = http_.begin(secure_client_, url);
-  else           ok = http_.begin(insecure_client_, url);
-
-  if (!ok) {
-    Serial.println("[HELLO] http.begin() 실패");
-    setLastError("HELLO HTTP 연결 실패");
-    scheduleNextNetwork();
-    return false;
-  }
-
-  http_.setTimeout(15000);
-  http_.setReuse(false);  // keep-alive 끄기
-  http_.setUserAgent("OrbiSyncNode/1.0.0 (ESP8266)");
-  http_.addHeader("Content-Type", "application/json");
-
-  StaticJsonDocument<768> payload;
-  payload["slot_id"] = config_.slotId;
-  payload["nonce"] = createNonce();
-  payload["firmware"] = config_.firmwareVersion;
-  payload["capabilities_hash"] = capabilitiesHash();
-
-  JsonObject device = payload.createNestedObject("device_info");
-  device["platform"] = "NodeMCU";
-  device["firmware"] = config_.firmwareVersion;
-  // ✅ 허브에서 MAC 기준으로 노드 중복/차단/정책 집행하기 쉽도록 포함(권장)
-  device["mac"] = WiFi.macAddress();
-
-  String reqBody;
-  AJ::serializeJson(payload, reqBody);
-
-  Serial.println("[HELLO] >>> REQUEST BODY");
-  Serial.println(reqBody);
-
-  int http_code = http_.POST(reqBody);
-  Serial.printf("[HELLO] HTTP CODE: %d\n", http_code);
-
-  if (http_code <= 0) {
-    Serial.printf("[HELLO] HTTP ERROR: %s\n", http_.errorToString(http_code).c_str());
-    http_.end();
-    setLastError("HELLO 네트워크 실패");
-    scheduleNextNetwork();
-    return false;
-  }
-
-  String respBody = http_.getString();
-  Serial.println("[HELLO] <<< RESPONSE RAW");
-  Serial.println(respBody);
-
-  DynamicJsonDocument doc(1024);
-  DeserializationError derr = deserializeJson(doc, respBody);
-  if (derr) {
-    Serial.printf("[HELLO] JSON ERROR: %s\n", derr.c_str());
-    http_.end();
-    setLastError("HELLO JSON 파싱 실패");
-    scheduleNextNetwork();
-    return false;
-  }
-
-  Serial.println("[HELLO] <<< RESPONSE JSON (pretty)");
-  serializeJsonPretty(doc, Serial);
-  Serial.println();
-
-  http_.end();
-
-  // non-2xx라도 body/status가 있을 수 있어 status 기반으로 처리한다.
-  const char* status = doc["status"];
-  Serial.printf("[HELLO] parsed status: %s\n", status ? status : "(null)");
-
-  if (!status) {
-    setLastError("HELLO 응답에 status 누락");
-    scheduleNextNetwork();
-    return false;
-  }
-
-  uint32_t now = millis();
-
-  // ✅ (옵션) 승인 모드 호환: PENDING/APPROVED
-  if (streq(status, "PENDING") || streq(status, "APPROVED")) {
-    Serial.println("[HELLO] -> transition PENDING_POLL");
-    transitionTo(State::PENDING_POLL);
-
-    uint32_t retry = doc["retry_after_ms"] | kDefaultPendingRetryMs;
-    Serial.printf("[HELLO] retry_after_ms=%lu\n", retry);
-
-    next_net_action_ms_ = now + retry;
-    net_backoff_ms_ = kInitialBackoffMs;
-    last_error_[0] = '\0';
-
-    Serial.println("================ HELLO END (PENDING) ================");
-    return true;
-  }
-
-  // ✅ 자동 승인 기본: GRANTED
-  // - 허브가 HELLO에서 토큰을 내려주면 저장
-  // - “기존대로 POLL_SESSION 수행”을 위해 PENDING_POLL로 진입시켜 pollSession()을 태운다.
-  //   (pollSession에서 토큰이 이미 있으면 /session 네트워크 호출 없이 ACTIVE로 전환)
-  if (streq(status, "GRANTED")) {
-    Serial.println("[HELLO] GRANTED by server");
-
-    const char* token = doc["session_token"];
-    uint32_t ttl = doc["ttl_seconds"] | 3600;
-
-    if (token && token[0] != '\0') {
-      if (strlen(token) >= sizeof(session_token_)) {
-        setLastError("HELLO 토큰 길이 초과");
-        clearSession();
-        transitionTo(State::HELLO);
-        scheduleNextNetwork();
-        Serial.println("================ HELLO END (GRANTED but token invalid) ================");
-        return false;
-      }
-      strncpy(session_token_, token, sizeof(session_token_) - 1);
-      session_token_[sizeof(session_token_) - 1] = '\0';
-      session_expires_at_ms_ = now + ttl * 1000;
-      Serial.printf("[HELLO] token saved, ttl=%lu sec\n", ttl);
-    } else {
-      // 구버전 허브(HELLO에 토큰 미포함) 호환: pollSession에서 토큰 받게 둔다.
-      clearSession();
-      Serial.println("[HELLO] no token in HELLO (fallback: get token via /session)");
-    }
-
-    transitionTo(State::PENDING_POLL);
-    next_net_action_ms_ = now;              // 즉시 pollSession 실행
-    net_backoff_ms_ = kInitialBackoffMs;
-    last_error_[0] = '\0';
-
-    Serial.println("================ HELLO END (GRANTED -> PENDING_POLL) ================");
-    return true;
-  }
-
-  // ✅ 슬롯 FULL 등 정책 거절: REJECT/DENIED
-  // - 이 경우 POLL_SESSION은 절대 수행하면 안 된다.
-  // - retry_after_ms가 있으면 최우선 적용(없으면 기본 60초)
-  if (streq(status, "REJECT") || streq(status, "DENIED")) {
-    const char* reason = doc["reason"];
-    uint32_t retry = doc["retry_after_ms"] | kDefaultRejectRetryMs;
-
-    Serial.printf("[HELLO] REJECT/DENIED by server reason=%s retry_after_ms=%lu\n",
-                  reason ? reason : "(none)", retry);
-
-    clearSession();
-    transitionTo(State::HELLO);
-
-    if (reason && reason[0]) {
-      String msg = String("HELLO 거절: ") + reason;
-      setLastError(msg.c_str());
-    } else {
-      setLastError("HELLO 거절됨");
-    }
-
-    // ✅ 정책 거절은 지수백오프 대신 retry_after를 존중해 다음 HELLO 타이밍을 직접 예약
-    next_net_action_ms_ = now + retry;
-    net_backoff_ms_ = kInitialBackoffMs;
-
-    Serial.println("================ HELLO END (REJECT/DENIED) ================");
-    return false;
-  }
-
-  Serial.println("[HELLO] 알 수 없는 status 값");
-  setLastError("HELLO 상태 알 수 없음");
-  scheduleNextNetwork();
-
-  Serial.println("================ HELLO END (UNKNOWN) ================");
-  return false;
-}
-
-bool OrbiSyncNode::pollSession() {
-
-  uint32_t now = millis();
-
-  Serial.println("\n================ SESSION POLL BEGIN ================");
-  Serial.printf("[SESSION] now=%lu next=%lu state=%d wifi=%d heap=%u\n",
-                now,
-                next_net_action_ms_,
-                (int)state_,
-                (int)WiFi.status(),
-                ESP.getFreeHeap());
-
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[SESSION] WiFi disconnected -> retry later");
-    setLastError("SESSION 전 Wi-Fi 끊김");
-    scheduleNextNetwork();
-    return false;
-  }
-
-  // ✅ HELLO에서 이미 토큰을 받았으면 /session 네트워크 호출 없이 바로 ACTIVE로 전환
-  //    (그래도 상태머신 상으로는 “POLL_SESSION 단계”를 한 번 거치므로 흐름은 유지됨)
-  if (isSessionValid()) {
-    Serial.println("[SESSION] token already valid (from HELLO) -> ACTIVE without HTTP");
-
-    transitionTo(State::ACTIVE);
-
-    last_heartbeat_ms_ = now;
-    next_net_action_ms_ = now;
-    net_backoff_ms_ = kInitialBackoffMs;
-
-    uint32_t commandDelay = config_.commandPollIntervalMs ? config_.commandPollIntervalMs : config_.heartbeatIntervalMs;
-    next_command_action_ms_ = now + commandDelay;
-
-    last_error_[0] = '\0';
-
-    Serial.println("================ SESSION END (SKIP -> ACTIVE) ================");
-    return true;
-  }
-
-  String url = String(config_.hubBaseUrl) + "/api/device/session";
-  Serial.printf("[SESSION] URL: %s\n", url.c_str());
-
-  // TLS
-  if (use_https_) {
-    Serial.println("[SESSION] HTTPS mode");
-    if (!applyTlsPolicy()) {
-      Serial.println("[SESSION] TLS policy FAILED");
-      setLastError("TLS 정책 적용 실패");
-      scheduleNextNetwork();
-      return false;
-    }
-  } else {
-    Serial.println("[SESSION] HTTP mode");
-  }
-
-  bool ok = false;
-  if (use_https_) ok = http_.begin(secure_client_, url);
-  else           ok = http_.begin(insecure_client_, url);
-
-  if (!ok) {
-    Serial.println("[SESSION] http.begin() FAILED");
-    setLastError("SESSION HTTP 준비 실패");
-    scheduleNextNetwork();
-    return false;
-  }
-
-  http_.setTimeout(15000);
-  http_.setReuse(false);
-  http_.addHeader("Content-Type", "application/json");
-
-  // ==============================
-  // 요청 바디 출력
-  // ==============================
-  StaticJsonDocument<256> payload;
-  payload["slot_id"] = config_.slotId;
-  payload["nonce"] = createNonce();
-
-  String body;
-  AJ::serializeJson(payload, body);
-
-  Serial.println("[SESSION] >>> REQUEST BODY");
-  Serial.println(body);
-
-  // ==============================
-  // HTTP 요청
-  // ==============================
-  int http_code = http_.POST(body);
-
-  Serial.printf("[SESSION] HTTP CODE: %d\n", http_code);
-
-  if (http_code <= 0) {
-    Serial.printf("[SESSION] HTTP ERROR: %s\n",
-                  http_.errorToString(http_code).c_str());
-    http_.end();
-    scheduleNextNetwork();
-    return false;
-  }
-
-  // ==============================
-  // RAW 응답 먼저 출력 (디버그 핵심)
-  // ==============================
-  String raw = http_.getString();
-
-  Serial.println("[SESSION] <<< RESPONSE RAW");
-  Serial.println(raw);
-
-  // ==============================
-  // JSON 파싱
-  // ==============================
-  DynamicJsonDocument doc(512);
-  auto err = deserializeJson(doc, raw);
-
-  if (err) {
-    Serial.printf("[SESSION] JSON PARSE FAILED: %s\n", err.c_str());
-    http_.end();
-    scheduleNextNetwork();
-    return false;
-  }
-
-  Serial.println("[SESSION] <<< RESPONSE JSON (pretty)");
-  serializeJsonPretty(doc, Serial);
-  Serial.println();
-
-  http_.end();
-
-  // ==============================
-  // 상태 분기 로그
-  // ==============================
-  const char* status = doc["status"];
-
-  Serial.printf("[SESSION] parsed status: %s\n", status ? status : "(null)");
-
-  if (!status) {
-    Serial.println("[SESSION] status missing -> retry");
-    scheduleNextNetwork();
-    return false;
-  }
-
-  // ------------------------------
-  // PENDING
-  // ------------------------------
-  if (streq(status, "PENDING")) {
-    uint32_t retry = doc["retry_after_ms"] | kDefaultPendingRetryMs;
-
-    Serial.printf("[SESSION] PENDING -> retry_after_ms=%lu\n", retry);
-
-    transitionTo(State::PENDING_POLL);
-    next_net_action_ms_ = now + retry;
-
-    Serial.println("================ SESSION END (PENDING) ================");
-    return true;
-  }
-
-  // ------------------------------
-  // GRANTED (ACTIVE 진입)
-  // ------------------------------
-  if (streq(status, "GRANTED")) {
-    const char* token = doc["session_token"];
-
-    Serial.printf("[SESSION] GRANTED token_len=%d\n",
-                  token ? (int)strlen(token) : -1);
-
-    if (!token || strlen(token) >= sizeof(session_token_)) {
-      Serial.println("[SESSION] token invalid -> reset");
-      setLastError("SESSION 토큰 오류");
-      clearSession();
-      transitionTo(State::HELLO);
-      scheduleNextNetwork();
-      return false;
-    }
-
-    strncpy(session_token_, token, sizeof(session_token_) - 1);
-    session_token_[sizeof(session_token_) - 1] = '\0';
-
-    uint32_t ttl = doc["ttl_seconds"] | 3600;
-
-    Serial.printf("[SESSION] TTL=%lu sec -> ACTIVE MODE\n", ttl);
-
-    session_expires_at_ms_ = now + ttl * 1000;
-
-    transitionTo(State::ACTIVE);
-
-    last_heartbeat_ms_ = now;
-    next_net_action_ms_ = now;
-    net_backoff_ms_ = kInitialBackoffMs;
-
-    uint32_t commandDelay = config_.commandPollIntervalMs ? config_.commandPollIntervalMs : config_.heartbeatIntervalMs;
-    next_command_action_ms_ = now + commandDelay;
-
-    last_error_[0] = '\0';
-
-    Serial.println("================ SESSION END (GRANTED -> ACTIVE) ================");
-    return true;
-  }
-
-  // ------------------------------
-  // DENIED / REJECT
-  // ------------------------------
-  if (streq(status, "DENIED") || streq(status, "REJECT")) {
-    Serial.println("[SESSION] DENIED/REJECT -> back to HELLO");
-
-    clearSession();
-    transitionTo(State::HELLO);
-
-    // ✅ 정책 거절이면 retry_after_ms 우선(없으면 기본 60초)
-    uint32_t retry = doc["retry_after_ms"] | kDefaultRejectRetryMs;
-    next_net_action_ms_ = now + retry;
-    net_backoff_ms_ = kInitialBackoffMs;
-
-    setLastError("SESSION 거절됨");
-
-    Serial.println("================ SESSION END (DENIED/REJECT) ================");
-    return false;
-  }
-
-  // ------------------------------
-  // UNKNOWN
-  // ------------------------------
-  Serial.println("[SESSION] UNKNOWN STATUS -> retry");
-  setLastError("SESSION 상태 알 수 없음");
-  scheduleNextNetwork();
-
-  Serial.println("================ SESSION END (UNKNOWN) ================");
-  return false;
-}
-
-bool OrbiSyncNode::sendHeartbeat() {
-  if (!isSessionValid()) {
-    setLastError("세션 없어서 Heartbeat 생략");
-    return false;
-  }
-  if (WiFi.status() != WL_CONNECTED) {
-    setLastError("Heartbeat 전 Wi-Fi 끊김");
-    return false;
-  }
-
-  String url = String(config_.hubBaseUrl) + "/api/device/heartbeat";
-  if (use_https_) {
-    if (!applyTlsPolicy()) {
-      setLastError("TLS 정책 적용 실패");
-      scheduleNextNetwork();
-      return false;
-    }
-  }
-  bool ok = false;
-  if (use_https_) ok = http_.begin(secure_client_, url);
-  else           ok = http_.begin(insecure_client_, url);
-  if (!ok) {
-    setLastError("Heartbeat HTTP 준비 실패");
-    scheduleNextNetwork();
-    return false;
-  }
-  http_.setTimeout(10000);
-  http_.addHeader("Content-Type", "application/json");
-  if (session_token_[0] != '\0') {
-    http_.addHeader("Authorization", String("Bearer ") + session_token_);
-  }
-
-  StaticJsonDocument<512> payload;
-  payload["slot_id"] = config_.slotId;
-  payload["nonce"] = createNonce();
-  payload["firmware"] = config_.firmwareVersion;
-  payload["uptime_ms"] = millis();
-  payload["rssi"] = WiFi.RSSI();
-  payload["free_heap"] = ESP.getFreeHeap();
-  payload["capabilities_hash"] = capabilitiesHash();
-  payload["led_state"] = led_state_;
-  String body;
-  AJ::serializeJson(payload, body);
-
-  int http_code = http_.POST(body);
-  DynamicJsonDocument doc(256);
-  if (!responseToJson(doc)) {
-    scheduleNextNetwork();
-    return false;
-  }
-  http_.end();
-
-  uint32_t now = millis();
-  if (http_code == 401 || http_code == 403) {
-    setLastError("Heartbeat 인증 실패");
-    clearSession();
-    transitionTo(State::HELLO);
-    scheduleNextNetwork();
-    return false;
-  }
-  if (http_code < 200 || http_code >= 300) {
-    setLastError("Heartbeat HTTP 오류");
-    scheduleNextNetwork();
-    return false;
-  }
-
-  if (doc.containsKey("ttl_seconds")) {
-    uint32_t ttl = doc["ttl_seconds"];
-    session_expires_at_ms_ = now + ttl * 1000;
-  }
-
-  if (config_.blinkOnHeartbeat) {
-    led_state_ = !led_state_;
-    pinMode(config_.ledPin, OUTPUT);
-    digitalWrite(config_.ledPin, led_state_ ? HIGH : LOW);
-  }
-
-  last_heartbeat_ms_ = now;
-  net_backoff_ms_ = kInitialBackoffMs;
-  next_net_action_ms_ = now + config_.heartbeatIntervalMs;
-  return true;
-}
-
-bool OrbiSyncNode::pullCommands() {
-  if (!config_.enableCommandPolling || !isSessionValid()) {
-    return true;
-  }
-  if (WiFi.status() != WL_CONNECTED) {
-    setLastError("Command pull: Wi-Fi 끊김");
-    return false;
-  }
-
-  String url = String(config_.hubBaseUrl) + "/api/device/commands/pull";
-  if (use_https_) {
-    if (!applyTlsPolicy()) {
-      setLastError("TLS 정책 적용 실패");
-      scheduleNextNetwork();
-      return false;
-    }
-  }
-  bool ok = false;
-  if (use_https_) ok = http_.begin(secure_client_, url);
-  else           ok = http_.begin(insecure_client_, url);
-  if (!ok) {
-    setLastError("Command pull HTTP 준비 실패");
-    scheduleNextNetwork();
-    return false;
-  }
-  http_.setTimeout(10000);
-  http_.addHeader("Content-Type", "application/json");
-  if (session_token_[0] != '\0') {
-    http_.addHeader("Authorization", String("Bearer ") + session_token_);
-  }
-
-  StaticJsonDocument<256> payload;
-  payload["slot_id"] = config_.slotId;
-  payload["nonce"] = createNonce();
-  String body;
-  AJ::serializeJson(payload, body);
-
-  int http_code = http_.POST(body);
-  DynamicJsonDocument doc(768);
-  if (!responseToJson(doc)) {
-    scheduleNextNetwork();
-    return false;
-  }
-  http_.end();
-
-  if (http_code < 200 || http_code >= 300) {
-    setLastError("Command pull HTTP 오류");
-    scheduleNextNetwork();
-    return false;
-  }
-
-  if (!doc.containsKey("commands")) {
-    net_backoff_ms_ = kInitialBackoffMs;
-    last_error_[0] = '\0';
-    return true;
-  }
-
-  JsonArray commands = doc["commands"].as<JsonArray>();
-  for (JsonObject command : commands) {
-    handleCommand(command);
-  }
-
-  net_backoff_ms_ = kInitialBackoffMs;
-  last_error_[0] = '\0';
-  return true;
-}
-
-bool OrbiSyncNode::handleCommand(JsonObject command) {
-  const char* cmd_id = command["id"];
-  const char* action = command["action"];
-  if (cmd_id == nullptr || action == nullptr) {
-    setLastError("명령 구조 오류");
-    return false;
-  }
-
-  String url = String(config_.hubBaseUrl) + "/api/device/commands/ack";
-  if (use_https_) {
-    if (!applyTlsPolicy()) {
-      setLastError("TLS 정책 적용 실패");
-      return false;
-    }
-  }
-  bool ok = false;
-  if (use_https_) ok = http_.begin(secure_client_, url);
-  else           ok = http_.begin(insecure_client_, url);
-  if (!ok) {
-    setLastError("Command ack HTTP 실패");
-    return false;
-  }
-  http_.setTimeout(10000);
-  http_.addHeader("Content-Type", "application/json");
-  if (session_token_[0] != '\0') {
-    http_.addHeader("Authorization", String("Bearer ") + session_token_);
-  }
-
-  StaticJsonDocument<256> ackPayload;
-  ackPayload["slot_id"] = config_.slotId;
-  ackPayload["command_id"] = cmd_id;
-  ackPayload["nonce"] = createNonce();
-  ackPayload["status"] = "handled";
-  String ackBody;
-  AJ::serializeJson(ackPayload, ackBody);
-  int http_code = http_.POST(ackBody);
-  http_.end();
-
-  if (http_code < 200 || http_code >= 300) {
-    setLastError("Command ack 실패");
-    return false;
-  }
-  return true;
-}
-
-bool OrbiSyncNode::isSessionValid() const {
-  if (session_token_[0] == '\0') {
-    return false;
-  }
-  if (session_expires_at_ms_ == 0) {
-    return true;
-  }
-  return millis() < session_expires_at_ms_;
 }
 
 void OrbiSyncNode::loopTick() {
-  uint32_t now = millis();
-  ensureWiFi();
-
-  // WS 연결 상태 변화 감지
-  bool ws_connected_current = ws_connected_;
-  if (config_.enableTunnel) {
-    ws_client_.loop();
-    if (!ws_connected_) {
-      connectTunnelWs(now);
-    }
-  }
-  if (ws_connected_current != ws_connected_) {
-    // WS 연결 상태 변화는 handleWsEvent에서 처리됨
-  }
-
-  if (state_ == State::ERROR) {
-    return;
-  }
-
-  if (state_ == State::BOOT && WiFi.status() == WL_CONNECTED) {
-    transitionTo(State::HELLO);
-    next_net_action_ms_ = now;
-  }
-
-  if (state_ == State::ACTIVE && (!isSessionValid() || WiFi.status() != WL_CONNECTED)) {
-    clearSession();
-    transitionTo(State::HELLO);
-    next_net_action_ms_ = now;
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    return;
-  }
-
-  switch (state_) {
-    case State::HELLO:
-      if (now >= next_net_action_ms_) {
-        sendHello();
-      }
-      break;
-    case State::PENDING_POLL:
-      if (now >= next_net_action_ms_) {
-        pollSession();
-      }
-      break;
-    case State::ACTIVE:
-      processActive(now);
-      break;
-    default:
-      break;
-  }
+ runStateMachine();
+ yield();
 }
 
-void OrbiSyncNode::processActive(uint32_t now) {
-  registerNodeIfNeeded(now);
-  if (config_.enableTunnel) {
-    connectTunnelWs(now);
-    if (ws_connected_ && (now - ws_last_heartbeat_ms_) >= OrbiSyncNodeConstants::kWsHeartbeatIntervalMs) {
-      sendHeartbeatFrame();
-    }
-  }
-  if (now >= next_net_action_ms_) {
-    sendHeartbeat();
-  }
-  if (config_.enableCommandPolling) {
-    uint32_t commandDelay = config_.commandPollIntervalMs ? config_.commandPollIntervalMs : config_.heartbeatIntervalMs;
-    if (now >= next_command_action_ms_) {
-      pullCommands();
-      next_command_action_ms_ = now + commandDelay;
-    }
-  }
+// ---- WebSocket 이벤트 콜백 (메모리 할당 없음) ----
+static void wsEvent(WStype_t type, uint8_t* payload, size_t len) {
+ if (!s_nodeForWs) return;
+
+ switch (type) {
+   case WStype_CONNECTED: {
+     if (!s_nodeForWs) return;
+     const char* url = s_nodeForWs->getTunnelUrl();
+     Serial.println("========================================");
+     Serial.println("[TUNNEL] WebSocket Handshake SUCCESS");
+     Serial.println("========================================");
+     Serial.printf("URL: %s\n", url ? url : "(none)");
+     Serial.println("HTTP Upgrade: 101 Switching Protocols");
+     Serial.println("Connection: Upgrade");
+     Serial.println("Upgrade: websocket");
+     Serial.println("Sec-WebSocket-Accept: <server-response>");
+     Serial.println("========================================");
+     Serial.println("[TUNNEL] Sending register message...");
+     s_nodeForWs->tunnelSendRegister();
+     break;
+   }
+
+   case WStype_DISCONNECTED: {
+     // Try to get close code/reason if available (library-dependent)
+     Serial.printf("[TUNNEL] disconnected len=%u (will reconnect with backoff)\n", (unsigned)len);
+     if (len > 0 && payload) {
+       // Some libraries pass close code as first 2 bytes
+       if (len >= 2) {
+         uint16_t closeCode = (payload[0] << 8) | payload[1];
+         Serial.printf("[TUNNEL] close_code=%u\n", closeCode);
+         if (len > 2) {
+           constexpr size_t kReasonPreview = 64;
+           size_t rlen = (len - 2) > kReasonPreview ? kReasonPreview : (len - 2);
+           Serial.printf("[TUNNEL] close_reason=");
+           for (size_t i = 2; i < 2 + rlen; i++) {
+             char c = (char)payload[i];
+             Serial.print((c >= 32 && c < 127) ? c : '.');
+           }
+           if (len > 2 + kReasonPreview) Serial.print("...");
+           Serial.println();
+         }
+       }
+     }
+     s_tunnelDisconnectPending = true;
+     break;
+   }
+
+   case WStype_ERROR: {
+     Serial.println("========================================");
+     Serial.println("[TUNNEL] WebSocket Handshake FAILED");
+     Serial.println("========================================");
+     Serial.printf("Error payload length: %u\n", (unsigned)len);
+     if (len > 0 && payload) {
+       constexpr size_t kErrorPreview = 128;
+       size_t pl = len > kErrorPreview ? kErrorPreview : len;
+       Serial.printf("Error data: ");
+       for (size_t i = 0; i < pl; i++) {
+         char c = (char)payload[i];
+         Serial.print((c >= 32 && c < 127) ? c : '.');
+       }
+       if (len > kErrorPreview) Serial.print("...");
+       Serial.println();
+     }
+     Serial.println("Possible causes:");
+     Serial.println("1. TLS/SSL handshake failed (certificate/SNI issue)");
+     Serial.println("2. Server rejected HTTP Upgrade request");
+     Serial.println("3. Network connectivity issue");
+     Serial.println("4. Wrong host/port/path");
+     Serial.println("5. Authorization header rejected");
+     Serial.println("========================================");
+     s_tunnelDisconnectPending = true;
+     break;
+   }
+
+   case WStype_TEXT:
+     if (s_nodeForWs && payload && len > 0) {
+       constexpr size_t kWsRxPreview = 256;
+       size_t pl = len > kWsRxPreview ? kWsRxPreview : len;
+       Serial.printf("[WS_RX] len=%u data=", (unsigned)len);
+       for (size_t i = 0; i < pl; i++) {
+         char c = (char)payload[i];
+         Serial.print((c >= 32 && c < 127) ? c : '.');
+       }
+       if (len > kWsRxPreview) Serial.print("...");
+       Serial.println();
+       s_nodeForWs->tunnelHandleMessage(payload, len);
+     }
+     break;
+
+   case WStype_BIN:
+     Serial.printf("[TUNNEL] rx BIN len=%u (ignored)\n", (unsigned)len);
+     break;
+
+   case WStype_PING:
+     Serial.println("[TUNNEL] rx PING");
+     break;
+
+   case WStype_PONG:
+     Serial.println("[TUNNEL] rx PONG");
+     break;
+
+   default:
+     Serial.printf("[TUNNEL] ws_event type=%d len=%u\n", (int)type, (unsigned)len);
+     break;
+ }
 }
 
-bool OrbiSyncNode::registerNodeIfNeeded(uint32_t now) {
-  if (!config_.enableNodeRegistration) {
-    return true;
-  }
-  if (is_registered_) {
-    return true;
-  }
-  if (now < next_register_action_ms_) {
-    return false;
-  }
+// -----------------------------
+// ---- 터널 연결 루프 (재연결/keepalive) ----
+/// 터널 연결 상태 확인 및 재연결 처리
+void OrbiSyncNode::tunnelLoop() {
+ uint32_t now = millis();
 
-  bool attempted = false;
-  bool success = false;
-  if (config_.preferRegisterBySlot) {
-    if (config_.loginToken && config_.slotId) {
-      attempted = true;
-      success = registerBySlot();
-    }
-    if (!success && config_.pairingCode) {
-      attempted = true;
-      success = registerByPairing();
-    }
-  } else {
-    if (config_.pairingCode) {
-      attempted = true;
-      success = registerByPairing();
-    }
-    if (!success && config_.loginToken && config_.slotId) {
-      attempted = true;
-      success = registerBySlot();
-    }
-  }
+ if (s_tunnelDisconnectPending) {
+   s_tunnelDisconnectPending = false;
+   WebSocketsClient* client = s_wsClient;
+   OrbiSyncNodeType* node = s_nodeForWs;
+   s_wsClient = nullptr;
+   s_nodeForWs = nullptr;
+   if (client) {
+     client->disconnect();
+     delete client;
+   }
+   if (node) node->tunnelDisconnectCleanup();
+   return;
+ }
 
-  if (!attempted) {
-    setLastError("등록 방식 설정 누락");
-    scheduleRegisterRetry(now);
-    return false;
-  }
+ if (!cfg_.enableTunnel) {
+   if (now - s_lastTunnelSkipLogMs >= kTunnelStatusLogIntervalMs) {
+     s_lastTunnelSkipLogMs = now;
+     Serial.println("[TUNNEL] skip: enableTunnel=0");
+   }
+   return;
+ }
+ if (!tunnelUrl_[0]) {
+   if (now - s_lastTunnelSkipLogMs >= kTunnelStatusLogIntervalMs) {
+     s_lastTunnelSkipLogMs = now;
+     Serial.println("[TUNNEL] skip: no tunnel_url (session/pair/approve not returned tunnel_url)");
+   }
+   return;
+ }
+ if (!nodeToken_[0] && !sessionToken_[0]) {
+   if (now - s_lastTunnelSkipLogMs >= kTunnelStatusLogIntervalMs) {
+     s_lastTunnelSkipLogMs = now;
+     Serial.println("[TUNNEL] skip: no node_token or session_token");
+   }
+   return;
+ }
 
-  if (success) {
-    register_backoff_ms_ = config_.registerRetryMs ? config_.registerRetryMs : kInitialBackoffMs;
-    next_register_action_ms_ = now;
-    is_registered_ = true;
-    // 등록 성공 콜백 호출
-    if (register_callback_ != nullptr && node_id_[0] != '\0') {
-      register_callback_(node_id_);
-    }
-    return true;
-  }
+ if (s_wsClient) {
+   s_wsClient->loop();
+   if (!s_wsClient) return;
 
-  scheduleRegisterRetry(now);
-  return false;
+   if (s_wsClient->isConnected()) {
+     if (now - s_lastTunnelStatusLogMs >= kTunnelStatusLogIntervalMs) {
+       s_lastTunnelStatusLogMs = now;
+       Serial.printf("[TUNNEL] connected=%s (registered=%d)\n", tunnelRegistered_ ? "true" : "false", tunnelRegistered_ ? 1 : 0);
+     }
+     if (tunnelRegistered_ && (now - lastTunnelPingMs_ >= kTunnelPingIntervalMs)) {
+       StaticJsonDocument<64> pingDoc;
+       pingDoc["type"] = "ping";
+       char pingBuf[64];
+       size_t n = serializeJson(pingDoc, pingBuf, sizeof(pingBuf));
+       if (n > 0 && n < sizeof(pingBuf)) {
+         pingBuf[n] = '\0';
+         if (tunnelSendText(pingBuf)) {
+           lastTunnelPingMs_ = now;
+           Serial.println("[TUNNEL] ping sent");
+         } else {
+           Serial.println("[TUNNEL] ping send failed");
+         }
+       }
+     }
+   }
+   yield();
+   return;
+ }
+
+ if (now < nextTunnelConnectMs_) return;
+
+ Serial.printf("[TUNNEL] start attempt state=%s heap=%u millis=%lu\n", stateStr(state_), (unsigned)ESP.getFreeHeap(), (unsigned long)now);
+ Serial.printf("[TUNNEL] reconnect: node_id=%s tunnel_id=%s\n", nodeId_[0] ? nodeId_ : "(none)", tunnelId_[0] ? tunnelId_ : "(none)");
+ setState(State::TUNNEL_CONNECTING);
+ tunnelConnect();
+ nextTunnelConnectMs_ = now + tunnelBackoffMs_;
 }
 
-bool OrbiSyncNode::registerBySlot() {
-  if (!config_.slotId || !config_.loginToken) {
-    setLastError("slot 기반 등록 정보 부족");
-    return false;
-  }
-  String url = String(config_.hubBaseUrl) + "/api/nodes/register_by_slot";
-  if (use_https_) {
-    if (!applyTlsPolicy()) {
-      setLastError("TLS 정책 적용 실패");
-      return false;
-    }
-  }
-  bool ok = false;
-  if (use_https_) ok = http_.begin(secure_client_, url);
-  else           ok = http_.begin(insecure_client_, url);
-  if (!ok) {
-    setLastError("register_by_slot HTTP 준비 실패");
-    return false;
-  }
-  http_.setTimeout(15000);
-  http_.addHeader("Content-Type", "application/json");
+/// WebSocket 연결 시작 (wss://hub.orbisync.io/ws/tunnel)
+void OrbiSyncNode::tunnelConnect() {
+ if (s_wsClient) return;
 
-  StaticJsonDocument<768> payload;
-  payload["slot_id"] = config_.slotId;
-  payload["login_token"] = (config_.loginToken && config_.loginToken[0]) ? config_.loginToken : "";
-  // machine_id / node_name은 라이브러리 내부에서 (prefix + 고유 suffix)로 자동 생성
-  payload["machine_id"] = machine_id_ptr_ ? machine_id_ptr_ : "";
-  payload["node_name"]  = node_name_ptr_  ? node_name_ptr_  : "";
-#if defined(ESP8266)
-  payload["platform"] = "esp8266";
-#else
-  payload["platform"] = "esp32";
-#endif
-  payload["agent_version"] = config_.firmwareVersion;
+ const char* url = tunnelUrl_;
+ if (!url || !url[0]) return;
 
-  String body;
-  AJ::serializeJson(payload, body);
-  int http_code = http_.POST(body);
-  DynamicJsonDocument doc(512);
-  if (!responseToJson(doc)) {
-    http_.end();
-    return false;
-  }
-  http_.end();
+ const char* auth = sessionToken_[0] ? sessionToken_ : nullptr;
+ if (!auth || !auth[0]) {
+   Serial.println("[TUNNEL] skip connect: session_token empty (run approve first)");
+   nextTunnelConnectMs_ = millis() + 3000;
+   nextApproveMs_ = 0;
+   return;
+ }
 
-  if (http_code != 201 && http_code != 200) {
-    setLastError("register_by_slot HTTP 응답 실패");
-    return false;
-  }
+ bool ssl = (strncmp(url, "wss://", 6) == 0);
+ if (!ssl && strncmp(url, "ws://", 5) != 0) {
+   Serial.printf("[TUNNEL] invalid URL scheme: %s (expected wss:// or ws://)\n", url);
+   return;
+ }
 
-  const char* nodeId = doc["node_id"];
-  const char* auth = doc["node_auth_token"];
-  const char* tunnel = doc["tunnel_url"];
-  if (nodeId == nullptr || auth == nullptr) {
-    setLastError("등록 응답 토큰 누락");
-    return false;
-  }
+ const char* hostStart = ssl ? url + 6 : url + 5;
+ const char* pathStart = strchr(hostStart, '/');
+ if (!pathStart) pathStart = "/";
 
-  strncpy(node_id_, nodeId, sizeof(node_id_) - 1);
-  strncpy(node_auth_token_, auth, sizeof(node_auth_token_) - 1);
-  if (tunnel) {
-    strncpy(tunnel_url_, tunnel, sizeof(tunnel_url_) - 1);
-  } else {
-    tunnel_url_[0] = '\0';
-  }
+ char host[128];
+ size_t hostLen = (size_t)(pathStart - hostStart);
+ if (hostLen >= sizeof(host)) hostLen = sizeof(host) - 1;
+ memcpy(host, hostStart, hostLen);
+ host[hostLen] = '\0';
 
-  return true;
+ uint16_t port = ssl ? 443 : 80;
+
+ // Validate path (must be /ws/tunnel)
+ if (strcmp(pathStart, "/ws/tunnel") != 0) {
+   Serial.printf("[TUNNEL] WARNING: path=%s (expected /ws/tunnel)\n", pathStart);
+ }
+
+ Serial.println("========================================");
+ Serial.println("[TUNNEL] WebSocket Handshake Debug");
+ Serial.println("========================================");
+ Serial.printf("URL: %s\n", url);
+ Serial.printf("Host: %s\n", host);
+ Serial.printf("Port: %u\n", port);
+ Serial.printf("Path: %s\n", pathStart);
+ Serial.printf("SSL/TLS: %s\n", ssl ? "YES (wss://)" : "NO (ws://)");
+ Serial.println("----------------------------------------");
+ Serial.println("Expected HTTP Upgrade Request:");
+ Serial.printf("GET %s HTTP/1.1\r\n", pathStart);
+ Serial.printf("Host: %s\r\n", host);
+ Serial.println("Connection: Upgrade");
+ Serial.println("Upgrade: websocket");
+ Serial.println("Sec-WebSocket-Key: <base64-random>");
+ Serial.println("Sec-WebSocket-Version: 13");
+ Serial.printf("Authorization: Bearer <token>\r\n");
+ Serial.println("========================================");
+
+ s_wsClient = new WebSocketsClient();
+ s_nodeForWs = this;
+
+ // Enable debug mode if available (Links2004 WebSocketsClient may support this)
+ // Note: Some versions use enableHeartbeat() or setReconnectInterval() for keepalive
+ // For TLS insecure mode, WebSocketsClient internally uses WiFiClientSecure
+ // which may need setInsecure() - but we can't access it directly here.
+ // The library should handle this based on beginSSL() parameters.
+
+ if (ssl) {
+   // beginSSL(host, port, path) - TLS connection
+   // Links2004 WebSocketsClient uses WiFiClientSecure internally
+   // For ESP32: WiFiClientSecure defaults to insecure if no CA is set
+   // For ESP8266: BearSSL needs explicit setInsecure() - but we can't access it here
+   Serial.println("[TUNNEL] Calling beginSSL() - TLS handshake will start");
+   s_wsClient->beginSSL(host, port, pathStart);
+ } else {
+   Serial.println("[TUNNEL] Calling begin() - non-TLS connection");
+   s_wsClient->begin(host, port, pathStart);
+ }
+
+ // Set authorization header BEFORE onEvent (order matters)
+ char authHeader[320];
+ int ahLen = snprintf(authHeader, sizeof(authHeader), "Bearer %s", auth);
+ if (ahLen > 0 && (size_t)ahLen < sizeof(authHeader)) {
+   s_wsClient->setAuthorization(authHeader);
+   // DEBUG ONLY: full token logging (remove in production)
+   logTokenPrefix("[TUNNEL] auth_header_set=1", auth);
+   Serial.printf("[TUNNEL] Authorization header length: %d bytes\n", ahLen);
+   Serial.printf("[TUNNEL] Authorization header: %s\n", authHeader);
+ } else {
+   Serial.println("[TUNNEL] ERROR: auth_header_set=0 (buffer fail)");
+   Serial.printf("[TUNNEL] Token length: %zu, Buffer size: %zu\n", strlen(auth), sizeof(authHeader));
+ }
+
+ // Set event callback
+ s_wsClient->onEvent(wsEvent);
+
+ Serial.printf("[TUNNEL] WebSocket client initialized\n");
+ Serial.printf("[TUNNEL] SNI/Host=%s (should match hub.orbisync.io)\n", host);
+ Serial.println("[TUNNEL] Waiting for connection result...");
+ Serial.println("========================================");
 }
 
-bool OrbiSyncNode::registerByPairing() {
-  if (!config_.pairingCode || !config_.slotId) {
-    setLastError("pairing 등록 정보 부족");
-    return false;
-  }
-  String url = String(config_.hubBaseUrl) + "/api/nodes/register";
-  if (use_https_) {
-    if (!applyTlsPolicy()) {
-      setLastError("TLS 정책 적용 실패");
-      return false;
-    }
-  }
-  bool ok = false;
-  if (use_https_) ok = http_.begin(secure_client_, url);
-  else           ok = http_.begin(insecure_client_, url);
-  if (!ok) {
-    setLastError("pairing HTTP 준비 실패");
-    return false;
-  }
-  http_.setTimeout(15000);
-  http_.addHeader("Content-Type", "application/json");
-  if (config_.internalKey && config_.internalKey[0]) {
-    http_.addHeader("X-Internal-Key", config_.internalKey);
-  }
+void OrbiSyncNode::tunnelDisconnectCleanup() {
+ tunnelRegistered_ = false;
+ if (tunnelChangeCb_) tunnelChangeCb_(false, tunnelUrl_[0] ? tunnelUrl_ : "");
 
-  StaticJsonDocument<768> payload;
-  payload["slot_id"] = config_.slotId;
-  payload["pairing_code"] = config_.pairingCode;
-  JsonObject info = payload.createNestedObject("node_info");
-  info["os"] = "arduino";
-#if defined(ESP8266)
-  info["arch"] = "esp8266";
-#else
-  info["arch"] = "esp32";
-#endif
-  info["version"] = config_.firmwareVersion;
+ if (state_ == State::TUNNEL_CONNECTING || state_ == State::TUNNEL_CONNECTED) {
+   setState(State::ACTIVE);
+ }
 
-  String body;
-  AJ::serializeJson(payload, body);
-  int http_code = http_.POST(body);
-  DynamicJsonDocument doc(512);
-  if (!responseToJson(doc)) {
-    http_.end();
-    return false;
-  }
-  http_.end();
-
-  if (http_code != 200 && http_code != 201) {
-    setLastError("pairing 등록 HTTP 실패");
-    return false;
-  }
-
-  const char* nodeId = doc["node_id"];
-  const char* auth = doc["node_auth_token"];
-  const char* tunnel = doc["tunnel_url"];
-  if (nodeId == nullptr || auth == nullptr) {
-    setLastError("pairing 응답 누락");
-    return false;
-  }
-
-  strncpy(node_id_, nodeId, sizeof(node_id_) - 1);
-  strncpy(node_auth_token_, auth, sizeof(node_auth_token_) - 1);
-  if (tunnel) {
-    strncpy(tunnel_url_, tunnel, sizeof(tunnel_url_) - 1);
-  } else {
-    tunnel_url_[0] = '\0';
-  }
-  return true;
+ if (tunnelBackoffIndex_ < kTunnelBackoffSteps - 1) tunnelBackoffIndex_++;
+ tunnelBackoffMs_ = kTunnelBackoffMs[tunnelBackoffIndex_];
+ nextTunnelConnectMs_ = millis() + tunnelBackoffMs_;
+ Serial.printf("[TUNNEL] fail disconnected backoff=%ums step=%u\n", (unsigned)tunnelBackoffMs_, (unsigned)tunnelBackoffIndex_);
 }
 
-bool OrbiSyncNode::connectTunnelWs(uint32_t now) {
-  if (!config_.enableTunnel || !is_registered_ || node_auth_token_[0] == '\0' || tunnel_url_[0] == '\0') {
-    return false;
-  }
-  if (ws_connected_) {
-    return true;
-  }
-  if (now < next_ws_action_ms_) {
-    return false;
-  }
+void OrbiSyncNode::tunnelDisconnect() {
+ WebSocketsClient* client = s_wsClient;
+ s_wsClient = nullptr;
+ s_nodeForWs = nullptr;
 
-  String host, path;
-  uint16_t port = 0;
-  bool secure = false;
-  if (!parseTunnelUrl(tunnel_url_, host, port, path, secure)) {
-    setLastError("터널 URL 파싱 실패");
-    scheduleWsRetry(now);
-    return false;
-  }
-
-  ws_extra_headers_ = String("Authorization: Bearer ") + node_auth_token_;
-  ws_client_.setExtraHeaders(ws_extra_headers_.c_str());
-  ws_client_.setReconnectInterval(0);
-  if (secure) {
-    ws_client_.beginSSL(host.c_str(), port, path.c_str());
-  } else {
-    ws_client_.begin(host.c_str(), port, path.c_str());
-  }
-
-  uint32_t delay = ws_backoff_ms_ ? ws_backoff_ms_ : kInitialBackoffMs;
-  next_ws_action_ms_ = now + delay;
-  ws_backoff_ms_ = min(ws_backoff_ms_ ? ws_backoff_ms_ * 2 : kInitialBackoffMs, kMaxBackoffMs);
-  return true;
+ if (client) {
+   client->disconnect();
+   delete client;
+ }
+ tunnelDisconnectCleanup();
 }
 
-bool OrbiSyncNode::sendRegisterFrame() {
-  if (!ws_connected_ || ws_register_frame_sent_) {
-    return true;
-  }
-  if (node_id_[0] == '\0') {
-    setLastError("WS register: node_id 없음");
-    return false;
-  }
-  StaticJsonDocument<256> payload;
-  payload["action"] = "register";
-  payload["node_id"] = node_id_;
-  payload["slot_id"] = config_.slotId ? config_.slotId : "";
-  payload["machine_id"] = machine_id_ptr_ ? machine_id_ptr_ : "";
-  payload["version"] = config_.firmwareVersion;
-#if defined(ESP8266)
-  payload["platform"] = "esp8266";
-#else
-  payload["platform"] = "esp32";
-#endif
-  payload["timestamp"] = millis();
-  String frame;
-  AJ::serializeJson(payload, frame);
-  if (ORBI_SYNC_WS_DEBUG) {
-    Serial.printf("[OrbiSync] WS reg payload: %s\n", frame.c_str());
-  }
-  bool ok = ws_client_.sendTXT(frame);
-  if (ok) {
-    ws_register_frame_sent_ = true;
-    ws_last_heartbeat_ms_ = millis();
-  } else {
-    setLastError("WS register frame 실패");
-    scheduleWsRetry(millis());
-  }
-  return ok;
+void OrbiSyncNode::setSessionToken(const char* token) {
+ if (!token) { sessionToken_[0] = '\0'; return; }
+ strncpy(sessionToken_, token, sizeof(sessionToken_) - 1);
+ sessionToken_[sizeof(sessionToken_) - 1] = '\0';
 }
 
-bool OrbiSyncNode::sendHeartbeatFrame() {
-  if (!ws_connected_ || !ws_register_frame_sent_) {
-    return false;
-  }
-  StaticJsonDocument<256> payload;
-  payload["action"] = "heartbeat";
-  payload["node_id"] = node_id_;
-  payload["timestamp"] = millis();
-  if (config_.slotId) {
-    payload["slot_id"] = config_.slotId;
-  }
-  String frame;
-  AJ::serializeJson(payload, frame);
-  if (ORBI_SYNC_WS_DEBUG) {
-    Serial.printf("[OrbiSync] WS heartbeat payload: %s\n", frame.c_str());
-  }
-  bool ok = ws_client_.sendTXT(frame);
-  if (ok) {
-    ws_last_heartbeat_ms_ = millis();
-  } else {
-    setLastError("WS heartbeat 실패");
-    ws_connected_ = false;
-    ws_register_frame_sent_ = false;
-    ws_client_.disconnect();
-    scheduleWsRetry(millis());
-  }
-  return ok;
+bool OrbiSyncNode::tunnelSendText(const char* text) {
+ if (!s_wsClient || !s_wsClient->isConnected() || !text) return false;
+ return s_wsClient->sendTXT(text);
 }
 
-void OrbiSyncNode::handleWsEvent(WStype_t type, uint8_t* payload, size_t length) {
-  switch (type) {
-    case WStype_DISCONNECTED:
-      if (ws_connected_) {
-        ws_connected_prev_ = ws_connected_;
-      }
-      ws_connected_ = false;
-      ws_register_frame_sent_ = false;
-      if (ws_connected_prev_) {
-        ws_connected_prev_ = false;
-        // 터널 해제 콜백 호출
-        if (tunnel_callback_ != nullptr) {
-          tunnel_callback_(false, tunnel_url_);
-        }
-      }
-      scheduleWsRetry(millis());
-      break;
-    case WStype_CONNECTED:
-      if (!ws_connected_) {
-        ws_connected_prev_ = false;
-      }
-      ws_connected_ = true;
-      ws_register_frame_sent_ = false;
-      ws_last_heartbeat_ms_ = millis();
-      ws_backoff_ms_ = kInitialBackoffMs;
-      next_ws_action_ms_ = 0;
-      if (!ws_connected_prev_) {
-        ws_connected_prev_ = true;
-        // 터널 연결 콜백 호출
-        if (tunnel_callback_ != nullptr) {
-          tunnel_callback_(true, tunnel_url_);
-        }
-      }
-      sendRegisterFrame();
-      break;
-    case WStype_TEXT:
-      handleWsMessage(payload, length);
-      break;
-    default:
-      break;
-  }
+void OrbiSyncNode::tunnelSendRegister() {
+ if (!s_wsClient || !s_wsClient->isConnected()) return;
+ if (tunnelChangeCb_) tunnelChangeCb_(true, tunnelUrl_[0] ? tunnelUrl_ : "");
+
+ /// Hub에 register 요청 전송 (터널 등록)
+ // /ws/tunnel registry: auth_token 필수(세션 토큰)
+ if (!sessionToken_[0]) {
+   Serial.println("[TUNNEL] register skip: session_token empty");
+   return;
+ }
+
+ char machineId[80];
+ getMachineId(machineId, sizeof(machineId));
+
+ StaticJsonDocument<512> doc;
+ doc["type"] = "register";
+ if (nodeId_[0]) doc["node_id"] = nodeId_;
+ doc["slot_id"] = cfg_.slotId && cfg_.slotId[0] ? cfg_.slotId : "";
+ doc["machine_id"] = machineId;
+ doc["mac"] = getMacCStr();
+ doc["firmware"] = (cfg_.firmwareVersion && cfg_.firmwareVersion[0]) ? cfg_.firmwareVersion : "1.0.0";
+ doc["auth_token"] = sessionToken_;
+
+ char buf[512];
+ size_t n = serializeJson(doc, buf, sizeof(buf));
+ if (n == 0 || n >= sizeof(buf)) return;
+ buf[n] = '\0';
+
+ Serial.print("[TUNNEL] register payload: ");
+ Serial.println(buf);
+
+ bool ok = tunnelSendText(buf);
+ Serial.printf("[TUNNEL] register sent ok=%d\n", ok ? 1 : 0);
 }
 
-void OrbiSyncNode::handleWsMessage(const uint8_t* payload, size_t length) {
-  DynamicJsonDocument doc(512);
-  auto err = AJ::deserializeJson(doc, payload, length);
-  if (err) {
-    setLastError("WS 메시지 JSON 파싱 실패");
-    return;
-  }
-  const char* type = doc["type"];
-  if (type == nullptr) {
-    return;
-  }
-  if (strcmp(type, "control") == 0) {
-    handleControl(doc);
-  } else if (strcmp(type, "data") == 0) {
-    handleData(doc);
-  }
+// ---- WebSocket 메시지 핸들러 ----
+void OrbiSyncNode::tunnelHandleMessage(const char* payload) {
+ if (!payload) return;
+ tunnelHandleMessage((const uint8_t*)payload, strlen(payload));
 }
 
-void OrbiSyncNode::handleControl(JsonDocument& doc) {
-  const char* cmd = doc["cmd"];
-  const char* streamId = doc["stream_id"];
-  if (cmd == nullptr || streamId == nullptr) {
-    return;
-  }
-  if (strcmp(cmd, "open_stream") == 0) {
-    strncpy(active_stream_id_, streamId, sizeof(active_stream_id_) - 1);
-    active_stream_id_[sizeof(active_stream_id_) - 1] = '\0';
-    stream_open_ = true;
-    request_buf_.clear();
-  } else if (strcmp(cmd, "close_stream") == 0) {
-    if (strcmp(active_stream_id_, streamId) == 0) {
-      stream_open_ = false;
-      request_buf_.clear();
-    }
-  }
+/// Hub → Node 메시지 처리 (HTTP_REQ, register_ack, RPC 등)
+void OrbiSyncNode::tunnelHandleMessage(const uint8_t* payload, size_t len) {
+ if (!payload || len == 0) return;
+
+ // JSON 파싱 (복사 없음)
+ StaticJsonDocument<1536> peek;
+ DeserializationError err = deserializeJson(peek, payload, len);
+ if (err) {
+   Serial.printf("[TUNNEL] rx parse err len=%u\n", (unsigned)len);
+   return;
+ }
+
+ // RPC envelope 처리: {id, method, path, body}
+ if (peek.containsKey("id") && peek.containsKey("path")) {
+   const char* method = peek["method"] | "GET";
+   const char* path = peek["path"] | "/";
+   JsonVariant bodyV = peek["body"];
+   size_t bodyLen = 0;
+   if (bodyV.is<JsonObject>() || bodyV.is<JsonArray>()) bodyLen = measureJson(bodyV);
+   else if (bodyV.is<const char*>()) bodyLen = strlen(bodyV.as<const char*>());
+ 
+   if (peek["id"].is<const char*>()) {
+     Serial.printf("[HTTP_TUNNEL] id=%s method=%s path=%s body_len=%u\n", peek["id"].as<const char*>(), method, path, (unsigned)bodyLen);
+   } else {
+     Serial.printf("[HTTP_TUNNEL] id=%ld method=%s path=%s body_len=%u\n", peek["id"].as<long>(), method, path, (unsigned)bodyLen);
+   }
+ 
+   bool isLedOn = (strcmp(path, "/led/on") == 0) || (strstr(path, "led/on") != nullptr);
+   int value = 1;
+   if (bodyV.is<JsonObject>()) value = bodyV["value"] | 1;
+ 
+   if (isLedOn && cfg_.ledPin >= 0) {
+     digitalWrite(cfg_.ledPin, value ? LOW : HIGH);
+   }
+ 
+   StaticJsonDocument<384> resp;
+   if (peek["id"].is<const char*>()) resp["id"] = peek["id"].as<const char*>();
+   else resp["id"] = peek["id"].as<long>();
+   resp["status"] = 200;
+   JsonObject b = resp.createNestedObject("body");
+   b["ok"] = true;
+   if (isLedOn) b["value"] = value ? 1 : 0;
+ 
+   char out[512];
+   size_t n = serializeJson(resp, out, sizeof(out));
+   if (n > 0 && n < sizeof(out)) {
+     out[n] = '\0';
+     tunnelSendText(out);
+   }
+   return;
+ }
+
+ const char* type = peek["type"] | "";
+ if (!type[0]) return;
+
+ // register_ack 처리: Hub가 register 요청 승인
+ if (strcmp(type, "register_ack") == 0) {
+   const char* st = peek["status"] | "";
+   const char* reason = peek["reason"] | "";
+   const char* detail = peek["detail"] | "";
+   const char* nid = peek["node_id"] | "";
+   const char* tid = peek["tunnel_id"] | "";
+   const char* tunUrl = peek["tunnel_url"] | peek["ws_url"] | "";
+   const char* thost = peek["tunnel_host"] | peek["domain"] | peek["host"] | "";
+
+   Serial.println("================================\n[TUNNEL REGISTER ACK]");
+   Serial.printf("status    = %s\n", st);
+   if (nid && nid[0]) Serial.printf("node_id   = %s\n", nid);
+   if (tid && tid[0]) Serial.printf("tunnel_id = %s\n", tid);
+   if (tunUrl && tunUrl[0]) Serial.printf("url       = %s\n", tunUrl);
+   if (thost && thost[0]) Serial.printf("host      = %s\n", thost);
+   if (reason[0]) Serial.printf("reason    = %s\n", reason);
+   if (detail[0]) Serial.printf("detail    = %s\n", detail);
+   Serial.println("================================");
+
+   if (strcmp(st, "ok") == 0) {
+     bool updated = false;
+     if (nid && nid[0]) {
+       strncpy(nodeId_, nid, sizeof(nodeId_) - 1);
+       nodeId_[sizeof(nodeId_) - 1] = '\0';
+       Serial.printf("[TUNNEL_ACK] ok node_id=%s\n", nodeId_);
+       updated = true;
+     }
+     if (tid && tid[0]) {
+       strncpy(tunnelId_, tid, sizeof(tunnelId_) - 1);
+       tunnelId_[sizeof(tunnelId_) - 1] = '\0';
+       Serial.printf("[TUNNEL_ACK] ok tunnel_id=%s\n", tunnelId_);
+       updated = true;
+     }
+     if (tunUrl && tunUrl[0]) {
+       // Store tunnel_url if provided (may differ from constructed URL)
+       strncpy(tunnelUrl_, tunUrl, sizeof(tunnelUrl_) - 1);
+       tunnelUrl_[sizeof(tunnelUrl_) - 1] = '\0';
+       Serial.printf("[TUNNEL_ACK] ok tunnel_url=%s\n", tunnelUrl_);
+       updated = true;
+     }
+     if (!updated) {
+       Serial.println("[TUNNEL_ACK] ok (no node_id/tunnel_id/tunnel_url in response)");
+     }
+     tunnelRegistered_ = true;
+     tunnelBackoffIndex_ = 0;
+     tunnelBackoffMs_ = kTunnelBackoffMs[0];
+     setState(State::TUNNEL_CONNECTED);
+     lastTunnelPingMs_ = millis();
+     Serial.println("[TUNNEL] connected=true (registered=1)");
+     if (tunnelMessageCb_) { }
+     return;
+   }
+
+   Serial.printf("[TUNNEL] register_ack status=error reason=%s detail=%s\n", reason, detail[0] ? detail : "(none)");
+   if (strcmp(reason, "MISSING_AUTH_TOKEN") == 0) {
+     Serial.println("[TUNNEL] action: re-run approve to get session_token");
+     sessionToken_[0] = '\0';
+     nextApproveMs_ = 0;
+     nextTunnelConnectMs_ = millis() + 3000;
+   } else if (strcmp(reason, "SLOT_ID_MISMATCH") == 0) {
+     Serial.println("[TUNNEL] action: align slot_id with token or fix payload");
+     nextTunnelConnectMs_ = millis() + tunnelBackoffMs_;
+   } else if (strcmp(reason, "SESSION_TOKEN_MISSING_SLOT_ID") == 0) {
+     Serial.println("[TUNNEL] action: check approve response / token type");
+     nextApproveMs_ = 0;
+     nextTunnelConnectMs_ = millis() + 3000;
+   } else {
+     nextTunnelConnectMs_ = millis() + tunnelBackoffMs_;
+   }
+   return;
+ }
+
+ // Hub → Node HTTP 요청 수신
+ if (strcmp(type, "HTTP_REQ") == 0) {
+   const char* streamId = peek["stream_id"] | "";
+   const char* method = peek["method"] | "GET";
+   const char* path = peek["path"] | "/";
+   
+   Serial.printf("[HTTP_REQ] stream_id=%s method=%s path=%s\n", streamId ? streamId : "(none)", method, path);
+   
+   // stream_id 검증 (응답 매칭 필수)
+   if (!streamId || !streamId[0]) {
+     Serial.println("[HTTP_REQ] ERROR: missing stream_id, cannot send HTTP_RES");
+     return;
+   }
+   
+   // Handle LED control
+   bool ledOn = false;
+   bool ledOff = false;
+   if (strcmp(path, "/led/on") == 0) {
+     ledOn = true;
+   } else if (strcmp(path, "/led/off") == 0) {
+     ledOff = true;
+   }
+   
+   int status = 200;
+   const char* bodyText = "OK";
+   
+   if (ledOn && cfg_.ledPin >= 0) {
+     digitalWrite(cfg_.ledPin, LOW);  // LOW = ON for most ESP32 boards
+     bodyText = "OK LED ON";
+     Serial.println("[HTTP_REQ] LED turned ON");
+   } else if (ledOff && cfg_.ledPin >= 0) {
+     digitalWrite(cfg_.ledPin, HIGH);  // HIGH = OFF for most ESP32 boards
+     bodyText = "OK LED OFF";
+     Serial.println("[HTTP_REQ] LED turned OFF");
+   } else if ((ledOn || ledOff) && cfg_.ledPin < 0) {
+     status = 500;
+     bodyText = "LED pin not configured";
+     Serial.println("[HTTP_REQ] ERROR: LED pin not configured");
+   }
+   
+   // Node → Hub HTTP 응답 전송
+   StaticJsonDocument<512> respDoc;
+   respDoc["type"] = "HTTP_RES";
+   respDoc["stream_id"] = streamId;  // 요청과 동일한 stream_id 사용
+   respDoc["status"] = status;
+   JsonObject headersObj = respDoc.createNestedObject("headers");
+   headersObj["content-type"] = "text/plain";
+   respDoc["body"] = bodyText;
+   
+   char respBuf[512];
+   size_t respLen = serializeJson(respDoc, respBuf, sizeof(respBuf));
+   if (respLen > 0 && respLen < sizeof(respBuf)) {
+     respBuf[respLen] = '\0';
+     bool sent = tunnelSendText(respBuf);
+     if (sent) {
+       Serial.printf("[HTTP_RES] sent stream_id=%s status=%d body=%s\n", streamId, status, bodyText);
+     } else {
+       Serial.printf("[HTTP_RES] FAILED to send stream_id=%s status=%d (WS not connected?)\n", streamId, status);
+     }
+   } else {
+     Serial.printf("[HTTP_RES] FAILED: buffer too small (needed %u, have %u)\n", (unsigned)respLen, (unsigned)sizeof(respBuf));
+     // Try to send error response with smaller body
+     StaticJsonDocument<256> errDoc;
+     errDoc["type"] = "HTTP_RES";
+     errDoc["stream_id"] = streamId;
+     errDoc["status"] = 500;
+     JsonObject errHeaders = errDoc.createNestedObject("headers");
+     errHeaders["content-type"] = "text/plain";
+     errDoc["body"] = "Internal error: response buffer overflow";
+     char errBuf[256];
+     size_t errLen = serializeJson(errDoc, errBuf, sizeof(errBuf));
+     if (errLen > 0 && errLen < sizeof(errBuf)) {
+       errBuf[errLen] = '\0';
+       tunnelSendText(errBuf);
+     }
+   }
+   return;
+ }
+
+ // proxy_request 처리 (레거시 형식)
+ if (strcmp(type, "proxy_request") == 0) {
+   const char* reqId = peek["request_id"] | peek["req_id"] | "";
+   const char* method = peek["method"] | "GET";
+   const char* path = peek["path"] | "/";
+   const char* bodyB64 = peek["body"] | "";
+   size_t bodyLen = bodyB64 && bodyB64[0] ? (strlen(bodyB64) / 4) * 3 : 0;
+   Serial.printf("[HTTP_TUNNEL] req_id=%s method=%s path=%s body_len=%u\n", reqId, method, path, (unsigned)bodyLen);
+   tunnelHandleProxyRequest(payload, len);
+   return;
+ }
+
+ if (cfg_.debugHttp) {
+   Serial.printf("[TUNNEL] rx type=%s len=%u\n", type, (unsigned)len);
+ }
 }
 
-void OrbiSyncNode::handleData(JsonDocument& doc) {
-  if (!stream_open_) {
-    return;
-  }
-  const char* direction = doc["direction"];
-  const char* payload64 = doc["payload_base64"];
-  if (direction == nullptr || payload64 == nullptr) {
-    return;
-  }
-  if (strcmp(direction, "c2n") != 0) {
-    return;
-  }
-  uint8_t decoded[OrbiSyncNodeConstants::kMaxStreamRequestSize];
-  size_t decodedLen = 0;
-  if (!base64Decode(payload64, decoded, decodedLen)) {
-    setLastError("WS 데이터 base64 디코딩 실패");
-    return;
-  }
-  if (request_buf_.length() + decodedLen > OrbiSyncNodeConstants::kMaxStreamRequestSize) {
-    int status = 413;
-    String json = "{\"ok\":false,\"error\":\"payload_too_large\"}";
-    String raw = buildHttpRawResponse(status, json);
-    sendDataFrame(active_stream_id_, (const uint8_t*)raw.c_str(), raw.length());
-    stream_open_ = false;
-    request_buf_.clear();
-    return;
-  }
-  request_buf_.concat(reinterpret_cast<const char*>(decoded), decodedLen);
-  tryProcessHttpRequest();
+void OrbiSyncNode::tunnelHandleProxyRequest(const uint8_t* payload, size_t len) {
+ if (!payload || len == 0) return;
+
+ StaticJsonDocument<1536> doc;
+ if (deserializeJson(doc, payload, len)) {
+   Serial.println("[HTTP_REQ] parse err");
+   return;
+ }
+
+ const char* reqId = doc["request_id"] | doc["req_id"] | "";
+ const char* method = doc["method"] | "GET";
+ const char* path = doc["path"] | "/";
+ const char* query = doc["query"] | "";
+ const char* bodyB64 = doc["body"] | "";
+
+ size_t maxBody = cfgOrDefaultSz(cfg_.maxTunnelBodyBytes, kDefaultMaxTunnelBody);
+ size_t bodyLen = 0;
+ uint8_t* bodyDec = nullptr;
+
+ if (bodyB64 && bodyB64[0]) {
+   size_t b64Len = strlen(bodyB64);
+   bodyLen = (b64Len / 4) * 3 + 4;
+   if (bodyLen > maxBody) {
+     Serial.printf("[HTTP_REQ] body too large %u -> 413\n", (unsigned)bodyLen);
+     TunnelHttpResponseWriter res;
+     res.node_ = this;
+     strncpy(res.requestId_, reqId, sizeof(res.requestId_) - 1);
+     res.requestId_[sizeof(res.requestId_) - 1] = '\0';
+     res.setStatus(413);
+     res.setHeader("Content-Type", "text/plain");
+     res.write("Payload Too Large");
+     res.end();
+     return;
+   }
+   bodyDec = (uint8_t*)malloc(bodyLen);
+   if (bodyDec) {
+     bodyLen = base64Decode(bodyDec, bodyB64, strlen(bodyB64));
+   } else {
+     bodyLen = 0;
+   }
+ }
+
+ TunnelHttpRequest req = {};
+ req.requestId = reqId;
+ req.streamId = reqId;
+ req.tunnelId = nodeId_;
+ req.method = method;
+ req.path = path;
+ req.query = query;
+ req.body = bodyDec;
+ req.bodyLen = bodyLen;
+ req.headerCount = 0;
+
+ JsonObject headers = doc["headers"];
+ if (headers) {
+   for (JsonPair p : headers) {
+     if (req.headerCount >= TUNNEL_MAX_HEADERS) break;
+     const char* k = p.key().c_str();
+     const char* v = p.value().as<const char*>();
+     if (k && v) {
+       strncpy(req.headers[req.headerCount].key, k, 23);
+       req.headers[req.headerCount].key[23] = '\0';
+       strncpy(req.headers[req.headerCount].value, v, 79);
+       req.headers[req.headerCount].value[79] = '\0';
+       req.headerCount++;
+     }
+   }
+ }
+
+ TunnelHttpResponseWriter res;
+ res.node_ = this;
+ strncpy(res.requestId_, reqId, sizeof(res.requestId_) - 1);
+ res.requestId_[sizeof(res.requestId_) - 1] = '\0';
+
+ bool isLedOn = (strstr(path, "led/on") != nullptr);
+
+ if (isLedOn) {
+   res.setStatus(200);
+   res.setHeader("Content-Type", "application/json");
+   res.write("{\"ok\":true,\"value\":1}");
+   res.end();
+ } else {
+   res.setStatus(200);
+   res.setHeader("Content-Type", "application/json");
+   char minBody[128];
+   int n = snprintf(minBody, sizeof(minBody), "{\"ok\":true,\"request_id\":\"%s\"}", reqId[0] ? reqId : "");
+   if (n > 0 && (size_t)n < sizeof(minBody)) res.write(minBody);
+   res.end();
+ }
+
+ if (httpRequestCb_) {
+   httpRequestCb_(req, res);
+ }
+
+ if (bodyDec) free(bodyDec);
+ if (!res.ended_) res.end();
 }
 
-bool OrbiSyncNode::tryProcessHttpRequest() {
-  int headerEnd = request_buf_.indexOf("\r\n\r\n");
-  if (headerEnd < 0) {
-    return false;
-  }
-  String requestLine = request_buf_.substring(0, request_buf_.indexOf("\r\n"));
-  int firstSpace = requestLine.indexOf(' ');
-  int secondSpace = requestLine.indexOf(' ', firstSpace + 1);
-  if (firstSpace < 0 || secondSpace < 0) {
-    return false;
-  }
-  String method = requestLine.substring(0, firstSpace);
-  String path = requestLine.substring(firstSpace + 1, secondSpace);
-  String header = request_buf_.substring(0, headerEnd);
-  int contentLen = 0;
-  int idx = header.indexOf("Content-Length:");
-  if (idx >= 0) {
-    int endLine = header.indexOf('\r', idx);
-    if (endLine < 0) {
-      endLine = header.length();
-    }
-    String lenStr = header.substring(idx + 15, endLine);
-    contentLen = lenStr.toInt();
-  }
-  int bodyStart = headerEnd + 4;
-  int availableBody = request_buf_.length() - bodyStart;
-  if (contentLen > availableBody) {
-    return false;
-  }
-  String body;
-  if (contentLen > 0) {
-    body = request_buf_.substring(bodyStart, bodyStart + contentLen);
-  }
+void OrbiSyncNode::tunnelSendProxyResponse(TunnelHttpResponseWriter& res) {
+ if (!s_wsClient || !s_wsClient->isConnected()) return;
 
-  int statusCode = 200;
-  String jsonBody;
-  const char* contentType = "application/json";
+ size_t b64Len = (res.bodyLen_ / 3 + 1) * 4 + 1;
+ char* b64 = (char*)malloc(b64Len);
+ if (!b64) return;
 
-  // 먼저 등록된 handler 호출
-  bool useHandler = false;
-  if (request_handler_ != nullptr) {
-    Request req;
-    req.proto = Protocol::HTTP;
-    req.method = method.c_str();
-    req.path = path.c_str();
-    req.body = reinterpret_cast<const uint8_t*>(body.c_str());
-    req.body_len = body.length();
+ base64Encode(b64, res.body_, res.bodyLen_);
 
-    Response resp;
-    resp.status = 200;
-    resp.content_type = "application/json";
-    resp.body = nullptr;
-    resp.body_len = 0;
+ StaticJsonDocument<1024> doc;
+ doc["type"] = "proxy_response";
+ doc["request_id"] = res.requestId_;
+ doc["status_code"] = res.statusCode_;
 
-    bool handled = request_handler_(req, resp);
-    if (handled && resp.body != nullptr && resp.body_len > 0) {
-      // handler가 true 반환하고 응답 제공: 그 응답 사용
-      statusCode = resp.status;
-      contentType = resp.content_type ? resp.content_type : "application/json";
-      // ESP8266 메모리 고려: String 대신 직접 복사
-      jsonBody.reserve(resp.body_len + 1);
-      jsonBody = "";
-      for (size_t i = 0; i < resp.body_len; i++) {
-        jsonBody += static_cast<char>(resp.body[i]);
-      }
-      useHandler = true;
-    }
-  }
+ JsonObject headersObj = doc.createNestedObject("headers");
+ for (uint8_t i = 0; i < res.headerCount_; i++) {
+   headersObj[res.headers_[i].key] = res.headers_[i].value;
+ }
 
-  // handler가 처리하지 않았거나 미등록: 기본 라우팅으로 fallback
-  if (!useHandler) {
-    jsonBody = routeHttpRequest(method, path, body, statusCode);
-  }
+ doc["body"] = b64;
 
-  String raw = buildHttpRawResponse(statusCode, jsonBody, contentType);
-  sendDataFrame(active_stream_id_, (const uint8_t*)raw.c_str(), raw.length());
-  stream_open_ = false;
-  request_buf_.clear();
-  active_stream_id_[0] = '\0';
-  return true;
+ char buf[1536];
+ size_t n = serializeJson(doc, buf, sizeof(buf));
+ if (n > 0 && n < sizeof(buf)) {
+   buf[n] = '\0';
+   tunnelSendText(buf);
+ }
+ free(b64);
+
+ Serial.printf("[HTTP_RESP] status=%d len=%u\n", res.statusCode_, (unsigned)res.bodyLen_);
 }
 
-String OrbiSyncNode::routeHttpRequest(const String& method, const String& path, const String& body, int& statusCode) {
-  String lowerPath = path;
-  lowerPath.toLowerCase();
-  String response;
-  uint32_t uptime = (millis() / 1000);
-  (void)uptime;
-  (void)body;
-
-  if (method == "GET" && (lowerPath == "/ping" || lowerPath == "/api/ping")) {
-    statusCode = 200;
-    response = "{\"ok\":true}";
-  } else if (method == "GET" && (lowerPath == "/status" || lowerPath == "/api/status")) {
-    statusCode = 200;
-    response = "{\"ok\":true,\"uptime_ms\":" + String(millis()) + ",\"node_id\":\"" + node_id_ + "\"}";
-  } else {
-    statusCode = 404;
-    response = "{\"ok\":false,\"error\":\"not_found\"}";
-  }
-  return response;
-}
-
-String OrbiSyncNode::buildHttpRawResponse(int statusCode, const String& jsonBody, const char* contentType) {
-  const char* statusText = (statusCode == 200) ? "OK" : (statusCode == 404 ? "Not Found" : "Error");
-  String raw = "HTTP/1.1 " + String(statusCode) + " " + statusText + "\r\n";
-  raw += "Content-Type: " + String(contentType ? contentType : "application/json") + "\r\n";
-  raw += "Content-Length: " + String(jsonBody.length()) + "\r\n";
-  raw += "Connection: close\r\n";
-  raw += "\r\n";
-  raw += jsonBody;
-  return raw;
-}
-
-bool OrbiSyncNode::sendDataFrame(const char* streamId, const uint8_t* data, size_t len) {
-  if (streamId == nullptr || streamId[0] == '\0') {
-    return false;
-  }
-  String encoded = base64Encode(data, len);
-  DynamicJsonDocument doc(512);
-  doc["type"] = "data";
-  doc["stream_id"] = streamId;
-  doc["direction"] = "n2c";
-  doc["payload_base64"] = encoded;
-  String frame;
-  AJ::serializeJson(doc, frame);
-  if (ORBI_SYNC_WS_DEBUG) {
-    Serial.printf("[OrbiSync] WS data payload: %s\n", frame.c_str());
-  }
-  return ws_client_.sendTXT(frame);
-}
-
-String OrbiSyncNode::base64Encode(const uint8_t* data, size_t length) {
-  static const char* table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  String encoded;
-  encoded.reserve(((length + 2) / 3) * 4);
-  for (size_t i = 0; i < length; i += 3) {
-    uint32_t val = data[i] << 16;
-    if (i + 1 < length) val |= data[i + 1] << 8;
-    if (i + 2 < length) val |= data[i + 2];
-    encoded += table[(val >> 18) & 0x3F];
-    encoded += table[(val >> 12) & 0x3F];
-    encoded += (i + 1 < length) ? table[(val >> 6) & 0x3F] : '=';
-    encoded += (i + 2 < length) ? table[val & 0x3F] : '=';
-  }
-  return encoded;
-}
-
-bool OrbiSyncNode::base64Decode(const char* input, uint8_t* output, size_t& outLen) {
-  auto decodeChar = [](char c) -> int {
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-    if (c >= '0' && c <= '9') return c - '0' + 52;
-    if (c == '+') return 62;
-    if (c == '/') return 63;
-    return -1;
-  };
-  int val = 0;
-  int valb = -8;
-  outLen = 0;
-  for (const char* ptr = input; *ptr; ++ptr) {
-    if (*ptr == '=') {
-      break;
-    }
-    int d = decodeChar(*ptr);
-    if (d < 0) {
-      continue;
-    }
-    val = (val << 6) | d;
-    valb += 6;
-    if (valb >= 0) {
-      output[outLen++] = (val >> valb) & 0xFF;
-      valb -= 8;
-    }
-  }
-  return true;
-}
-
-void OrbiSyncNode::scheduleWsRetry(uint32_t now) {
-  uint32_t delay = ws_backoff_ms_ ? ws_backoff_ms_ : kInitialBackoffMs;
-  next_ws_action_ms_ = now + delay;
-  ws_backoff_ms_ = min(ws_backoff_ms_ ? ws_backoff_ms_ * 2 : kInitialBackoffMs, kMaxBackoffMs);
-  ws_register_frame_sent_ = false;
-}
-
-bool OrbiSyncNode::parseTunnelUrl(const char* raw, String& host, uint16_t& port, String& path, bool& secure) const {
-  if (raw == nullptr || raw[0] == '\0') {
-    return false;
-  }
-  String url(raw);
-  path = "/";
-  secure = false;
-  if (url.startsWith("wss://")) {
-    secure = true;
-    url = url.substring(6);
-  } else if (url.startsWith("ws://")) {
-    url = url.substring(5);
-  } else if (url.startsWith("wss:")) {
-    secure = true;
-    url = url.substring(4);
-    if (url.startsWith("//")) {
-      url = url.substring(2);
-    }
-  }
-  int slashIdx = url.indexOf('/');
-  if (slashIdx >= 0) {
-    host = url.substring(0, slashIdx);
-    path = url.substring(slashIdx);
-  } else {
-    host = url;
-  }
-  int portIdx = host.indexOf(':');
-  if (portIdx >= 0) {
-    port = host.substring(portIdx + 1).toInt();
-    host = host.substring(0, portIdx);
-  } else {
-    port = secure ? 443 : 80;
-  }
-  return host.length() > 0;
-}
-
-bool OrbiSyncNode::isRegistered() const {
-  return is_registered_;
-}
-
-const char* OrbiSyncNode::getNodeId() const {
-  return node_id_;
-}
-
-const char* OrbiSyncNode::getNodeAuthToken() const {
-  return node_auth_token_;
-}
-
-const char* OrbiSyncNode::getTunnelUrl() const {
-  return tunnel_url_;
-}
-
-bool OrbiSyncNode::isTunnelConnected() const {
-  return ws_connected_;
-}
-
-void OrbiSyncNode::scheduleRegisterRetry(uint32_t now) {
-  uint32_t delay = register_backoff_ms_ ? register_backoff_ms_ : kInitialBackoffMs;
-  next_register_action_ms_ = now + delay;
-  register_backoff_ms_ = min(register_backoff_ms_ ? register_backoff_ms_ * 2 : kInitialBackoffMs, kMaxBackoffMs);
-}
-
-OrbiSyncNode::State OrbiSyncNode::getState() const {
-  return state_;
-}
-
-const char* OrbiSyncNode::getLastError() const {
-  return last_error_;
-}
-
-void OrbiSyncNode::clearSession() {
-  session_token_[0] = '\0';
-  session_expires_at_ms_ = 0;
-}
-
-String OrbiSyncNode::createNonce() {
-#if defined(ESP32)
-  uint32_t seedA = esp_random();
-#else
-  uint32_t seedA = static_cast<uint32_t>(random(0xFFFFFFFF)) ^ ESP.getChipId() ^ micros();
-#endif
-  uint32_t seedB = static_cast<uint32_t>(micros()) ^ (seedA << 5);
-  char buffer[24];
-  snprintf(buffer, sizeof(buffer), "%08X-%08X", seedA, seedB);
-  return String(buffer);
-}
-
-void OrbiSyncNode::setLastError(const char* msg) {
-  if (msg == nullptr) {
-    return;
-  }
-  bool error_changed = (strcmp(last_error_, msg) != 0);
-  strncpy(last_error_, msg, sizeof(last_error_) - 1);
-  last_error_[sizeof(last_error_) - 1] = '\0';
-  if (error_changed && error_callback_ != nullptr) {
-    error_callback_(last_error_);
-  }
-}
-
-void OrbiSyncNode::transitionTo(State newState) {
-  if (state_ != newState) {
-    State oldState = state_;
-    state_prev_ = state_;
-    state_ = newState;
-    if (state_change_callback_ != nullptr) {
-      state_change_callback_(oldState, newState);
-    }
-  }
-}
-
-void OrbiSyncNode::onRequest(RequestCallback callback) {
-  request_handler_ = callback;
-}
-
-void OrbiSyncNode::onStateChange(StateChangeCallback callback) {
-  state_change_callback_ = callback;
-}
-
-void OrbiSyncNode::onError(ErrorCallback callback) {
-  error_callback_ = callback;
-}
-
-void OrbiSyncNode::onRegistered(RegisterCallback callback) {
-  register_callback_ = callback;
-}
-
-void OrbiSyncNode::onTunnelChange(TunnelCallback callback) {
-  tunnel_callback_ = callback;
-}
-
-void OrbiSyncNode::scheduleNextNetwork(uint32_t delayMs) {
-  uint32_t now = millis();
-  uint32_t delay = delayMs ? delayMs : net_backoff_ms_;
-  next_net_action_ms_ = now + delay;
-  net_backoff_ms_ = min(net_backoff_ms_ * 2, kMaxBackoffMs);
-}
-
-void OrbiSyncNode::scheduleNextWiFi(uint32_t delayMs) {
-  uint32_t now = millis();
-  uint32_t delay = delayMs ? delayMs : wifi_backoff_ms_;
-  next_wifi_action_ms_ = now + delay;
-  wifi_backoff_ms_ = min(wifi_backoff_ms_ * 2, kMaxBackoffMs);
-}
-
-String OrbiSyncNode::capabilitiesHash() const {
-  uint32_t hash = 0;
-  for (uint8_t i = 0; i < config_.capabilityCount; ++i) {
-    const char* cap = config_.capabilities[i];
-    if (cap == nullptr) continue;
-    for (size_t j = 0; j < strlen(cap); ++j) {
-      hash = hash * 31 + static_cast<uint8_t>(cap[j]);
-    }
-  }
-  char buffer[12];
-  snprintf(buffer, sizeof(buffer), "%08X", hash);
-  return String(buffer);
-}
-
-void OrbiSyncNode::ensureIdentityInitialized() {
-  if (machine_id_ptr_ != nullptr && node_name_ptr_ != nullptr) {
-    return;
-  }
-
-  const String suffix = makeUniqueSuffix();
-
-  const char* midPrefix =
-      (config_.machineIdPrefix && config_.machineIdPrefix[0]) ? config_.machineIdPrefix :
-      (config_.machineId && config_.machineId[0]) ? config_.machineId : "";
-
-  const char* namePrefix =
-      (config_.nodeNamePrefix && config_.nodeNamePrefix[0]) ? config_.nodeNamePrefix :
-      (config_.nodeName && config_.nodeName[0]) ? config_.nodeName : "Node-";
-
-  if (config_.appendUniqueSuffix) {
-    machine_id_str_ = String(midPrefix) + suffix;
-    node_name_str_  = String(namePrefix) + suffix;
-    machine_id_ptr_ = machine_id_str_.c_str();
-    node_name_ptr_  = node_name_str_.c_str();
-  } else {
-    // 사용자가 완전한 문자열(고정값)을 직접 주고 싶을 때 사용
-    machine_id_ptr_ = midPrefix;
-    node_name_ptr_  = namePrefix;
-  }
-}
-
-String OrbiSyncNode::makeUniqueSuffix() const {
-  if (config_.useMacForUniqueId) {
-    String mac = WiFi.macAddress(); // "AA:BB:CC:DD:EE:FF"
-    if (mac.length() > 0) {
-      mac.replace(":", "");
-      mac.toLowerCase();
-      return mac;
-    }
-  }
-
-#if defined(ESP8266)
-  return String(ESP.getChipId(), HEX);
-#elif defined(ESP32)
-  char buf[17];
-  snprintf(buf, sizeof(buf), "%llx", (unsigned long long)ESP.getEfuseMac());
-  return String(buf);
-#else
-  return String(millis(), HEX);
-#endif
-}
-
-const char* OrbiSyncNode::getMachineId() const {
-  const_cast<OrbiSyncNode*>(this)->ensureIdentityInitialized();
-  return machine_id_ptr_ ? machine_id_ptr_ : "";
-}
-
-const char* OrbiSyncNode::getNodeName() const {
-  const_cast<OrbiSyncNode*>(this)->ensureIdentityInitialized();
-  return node_name_ptr_ ? node_name_ptr_ : "";
-}
-
-void OrbiSyncNode::setLoginToken(const char* loginToken) {
-  if (loginToken == nullptr) {
-    login_token_str_ = "";
-    config_.loginToken = nullptr;
-    return;
-  }
-  // 문자열 수명 보장(외부 포인터를 그대로 들고 있지 않음)
-  login_token_str_ = loginToken;
-  config_.loginToken = login_token_str_.c_str();
-}
-
-bool OrbiSyncNode::responseToJson(JsonDocument& doc) {
-  // NOTE:
-  // - HTTPClient::getSize()는 Content-Length를 int로 반환합니다.
-  // - 서버가 Content-Length를 주지 않으면 -1이 올 수 있는데,
-  //   이를 size_t로 받으면 매우 큰 값으로 변환되어 "응답 크기 제한 초과"가 오탐지됩니다.
-  const int contentLength = http_.getSize();
-
-  if (contentLength > 0 &&
-      contentLength > static_cast<int>(OrbiSyncNodeConstants::kMaxResponseLength)) {
-    Serial.printf("[ERROR] 응답 크기 제한 초과 (Content-Length=%d, limit=%u)\n",
-                  contentLength,
-                  static_cast<unsigned>(OrbiSyncNodeConstants::kMaxResponseLength));
-    setLastError("응답 크기 제한 초과");
-    http_.end();
-    return false;
-  }
-
-  WiFiClient* stream = http_.getStreamPtr();
-  if (stream == nullptr) {
-    setLastError("응답 스트림 없음");
-    http_.end();
-    return false;
-  }
-
-  // Content-Length가 없거나(-1) 큰 경우에도, 실제 읽는 바이트를 제한하며 파싱합니다.
-  CountingStream limited(*stream, OrbiSyncNodeConstants::kMaxResponseLength);
-
-  DeserializationError err = AJ::deserializeJson(doc, limited);
-  if (!err && !limited.overflow()) {
-    return true;
-  }
-
-  if (limited.overflow()) {
-    Serial.printf("[ERROR] 응답 크기 제한 초과 (read=%u, limit=%u)\n",
-                  static_cast<unsigned>(limited.bytesRead()),
-                  static_cast<unsigned>(OrbiSyncNodeConstants::kMaxResponseLength));
-    setLastError("응답 크기 제한 초과");
-    http_.end();
-    return false;
-  }
-
-  // 스트림 파싱 실패 시, 디버깅을 위해 제한 내에서 문자열로 한 번 더 시도합니다.
-  String response = http_.getString();
-  if (response.length() >
-      static_cast<int>(OrbiSyncNodeConstants::kMaxResponseLength)) {
-    setLastError("응답 크기 제한 초과");
-    http_.end();
-    return false;
-  }
-
-  err = AJ::deserializeJson(doc, response);
-  if (err) {
-    Serial.printf("[ERROR] JSON parse failed: %s\n", err.c_str());
-    setLastError("JSON 파싱 실패");
-    http_.end();
-    return false;
-  }
-
-  return true;
-}
+} // namespace OrbiSyncNode
