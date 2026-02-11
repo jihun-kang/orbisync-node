@@ -121,6 +121,9 @@ class TunnelHttpResponseWriter {
  
    size_t maxTunnelBodyBytes;       // default 4096
    uint32_t tunnelReconnectMs;      // default 5000
+
+   /// HELLO 요청에 reconnect=true, boot_reason 등 재연결 힌트 포함 (재부팅/복귀 시 Hub가 403 등 재연결로 처리 가능)
+   bool sendReconnectHintInHello;
  };
  
  struct Request {
@@ -141,6 +144,7 @@ class TunnelHttpResponseWriter {
  typedef void (*StateChangeCB)(State oldState, State newState);
  typedef void (*ErrorCB)(const char* error);
  typedef void (*RegisteredCB)(const char* nodeId);
+ typedef void (*SessionInvalidCB)(void);  /// 401/410 등으로 세션/페어링 무효 시 (스케치에서 NVS 등 클리어)
  typedef void (*TunnelChangeCB)(bool connected, const char* url);
  typedef bool (*RequestHandler)(const Request& req, Response& resp);
  typedef void (*TunnelMessageCB)(const char* json);
@@ -158,6 +162,7 @@ class OrbiSyncNode {
    void onStateChange(StateChangeCB cb) { stateChangeCb_ = cb; }
    void onError(ErrorCB cb) { errorCb_ = cb; }
    void onRegistered(RegisteredCB cb) { registeredCb_ = cb; }
+   void onSessionInvalid(SessionInvalidCB cb) { sessionInvalidCb_ = cb; }
    void onTunnelChange(TunnelChangeCB cb) { tunnelChangeCb_ = cb; }
    void onRequest(RequestHandler h) { requestHandler_ = h; }
    void onTunnelMessage(TunnelMessageCB cb) { tunnelMessageCb_ = cb; }
@@ -169,10 +174,13 @@ class OrbiSyncNode {
    const char* getTunnelUrl() const { return tunnelUrl_; }
    const char* getTunnelId() const { return tunnelId_; }
    const char* getSessionToken() const { return sessionToken_; }
+   const char* getSessionExpiresAt() const { return sessionExpiresAt_; }
    const char* getNodeToken() const { return nodeToken_; }
 
-   /// 세션 토큰 외부 설정
+   /// 세션 토큰 외부 설정 (NVS 복원 시)
    void setSessionToken(const char* token);
+   /// 세션 만료 시각 (ISO 문자열) 외부 설정. NVS 복원 시 스케치에서 설정 가능.
+   void setSessionExpiresAt(const char* expiresAt);
 
    // ---- 터널 관련 public 함수 ----
    /// 터널 연결 루프 (재연결/keepalive 처리)
@@ -204,7 +212,8 @@ class OrbiSyncNode {
    char tunnelUrl_[256];
    char tunnelId_[64];
    char sessionToken_[256];
- 
+   char sessionExpiresAt_[32];   // ISO datetime from Hub (expires_at / session_expires_at)
+
    static constexpr size_t kPairingCodeMax = 32;
    char pairingCode_[kPairingCodeMax];
    char pairingExpiresAt_[32];
@@ -233,6 +242,7 @@ class OrbiSyncNode {
    StateChangeCB stateChangeCb_;
    ErrorCB errorCb_;
    RegisteredCB registeredCb_;
+   SessionInvalidCB sessionInvalidCb_;
    TunnelChangeCB tunnelChangeCb_;
    RequestHandler requestHandler_;
    TunnelMessageCB tunnelMessageCb_;
@@ -250,6 +260,8 @@ class OrbiSyncNode {
    bool postDevicePair(const char* code, int* outStatus, char* outBody, size_t outBodyMax);
    void tryApprove();
    void trySessionPoll();
+   /// 저장된 session_token으로 /api/device/session 갱신 시도. 성공 시 ACTIVE, 실패(401/410) 시 토큰 클리어 후 false
+   bool trySessionRefresh();
    void tryRegisterBySlot();
    bool postJsonUnified(const char* path, const char* body, int* outStatus,
                         char* outBody, size_t outBodyMax);

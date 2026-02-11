@@ -15,6 +15,7 @@
  #include <WiFi.h>
  #include <WiFiClient.h>
  #include <WiFiClientSecure.h>
+ #include <esp_system.h>
 #else
  #error "Unsupported board"
 #endif
@@ -29,11 +30,11 @@
 // -----------------------------
 // Tunables
 // -----------------------------
-static constexpr uint32_t kBackoffMinMs = 1000;
-static constexpr uint32_t kBackoffMaxMs = 30000;
+static constexpr uint32_t kBackoffMinMs = 2000;   // hello 재시도 최소 2s (폭주 방지)
+static constexpr uint32_t kBackoffMaxMs = 60000; // hello 403 등 시 최대 60s
 
 static constexpr uint32_t kTunnelPingIntervalMs = 25000;
-static const uint32_t kTunnelBackoffMs[] = {1000, 2000, 5000, 10000, 30000};
+static const uint32_t kTunnelBackoffMs[] = {2000, 4000, 8000, 15000, 60000}; // 터널 끊김 시 재연결 백오프 (폭주 방지)
 static constexpr uint8_t kTunnelBackoffSteps = 5;
 
 static constexpr size_t kDefaultMaxTunnelBody = 4096;
@@ -575,6 +576,7 @@ OrbiSyncNode::OrbiSyncNode(const Config& config)
    stateChangeCb_(nullptr),
    errorCb_(nullptr),
    registeredCb_(nullptr),
+   sessionInvalidCb_(nullptr),
    tunnelChangeCb_(nullptr),
    requestHandler_(nullptr),
    tunnelMessageCb_(nullptr),
@@ -585,6 +587,7 @@ OrbiSyncNode::OrbiSyncNode(const Config& config)
  tunnelUrl_[0] = '\0';
  tunnelId_[0] = '\0';
  sessionToken_[0] = '\0';
+ sessionExpiresAt_[0] = '\0';
  pairingCode_[0] = '\0';
  pairingExpiresAt_[0] = '\0';
  pairingCodeValid_ = false;
@@ -703,7 +706,11 @@ bool OrbiSyncNode::isPairingExpired() const {
 // -----------------------------
 // Backoff
 // -----------------------------
-void OrbiSyncNode::advanceNetBackoff() { netBackoffMs_ = (netBackoffMs_ < kBackoffMaxMs / 2) ? (netBackoffMs_ * 2) : kBackoffMaxMs; }
+void OrbiSyncNode::advanceNetBackoff() {
+  uint32_t next = netBackoffMs_ * 2;
+  if (next > kBackoffMaxMs) next = kBackoffMaxMs;
+  netBackoffMs_ = next;
+}
 void OrbiSyncNode::advancePairBackoff() { pairBackoffMs_ = (pairBackoffMs_ < kBackoffMaxMs / 2) ? (pairBackoffMs_ * 2) : kBackoffMaxMs; }
 void OrbiSyncNode::resetNetBackoff() { netBackoffMs_ = kBackoffMinMs; }
 void OrbiSyncNode::resetPairBackoff() { pairBackoffMs_ = kBackoffMinMs; }
@@ -749,6 +756,16 @@ void OrbiSyncNode::tryHello() {
  doc["slot_id"] = cfg_.slotId ? cfg_.slotId : "";
  doc["firmware"] = (cfg_.firmwareVersion && cfg_.firmwareVersion[0]) ? cfg_.firmwareVersion : "1.0.0";
 
+ if (cfg_.sendReconnectHintInHello) {
+   doc["reconnect"] = true;
+#if defined(ESP32)
+   int r = (int)esp_reset_reason();
+   doc["boot_reason"] = (r == 1) ? "power" : (r == 3) ? "sw" : (r == 4) ? "watchdog" : "reboot";
+#else
+   doc["boot_reason"] = "reboot";
+#endif
+ }
+
  char capHashStr[9];
  snprintf(capHashStr, sizeof(capHashStr), "%08x", (unsigned)computeCapabilitiesHash());
  doc["capabilities_hash"] = capHashStr;
@@ -787,6 +804,29 @@ static void maskPairingForLog(const char* s, char* buf, size_t bufLen) {
 }
 
 void OrbiSyncNode::handleHelloResponse(int status, const char* body, size_t len) {
+ if (status == 410) {
+   Serial.println("[HELLO] 410 pairing expired -> clear pairing, retry HELLO with backoff");
+   clearPairingCode();
+   if (sessionInvalidCb_) sessionInvalidCb_();
+   nextHelloMs_ = millis() + netBackoffMs_;
+   advanceNetBackoff();
+   setState(State::HELLO);
+   return;
+ }
+ if (status == 403) {
+   Serial.printf("[HELLO] web_auth_failed/403 -> backoff %ums (2s~60s, no loop)\n", (unsigned)netBackoffMs_);
+   nextHelloMs_ = millis() + netBackoffMs_;
+   advanceNetBackoff();
+   setState(State::HELLO);
+   return;
+ }
+ if (status == 401) {
+   Serial.printf("[HELLO] 401 -> backoff %ums\n", (unsigned)netBackoffMs_);
+   nextHelloMs_ = millis() + netBackoffMs_;
+   advanceNetBackoff();
+   setState(State::HELLO);
+   return;
+ }
  if (status < 200 || status >= 300 || !body || len == 0) {
    Serial.printf("[HELLO] fail status=%d\n", status);
    advanceNetBackoff();
@@ -1028,6 +1068,17 @@ void OrbiSyncNode::tryApprove() {
    approveMissingMacFailed_ = true;
    return;
  }
+ if (status == 401 || status == 403 || status == 410) {
+   Serial.printf("[APPROVE] %d auth/pairing invalid -> clear session & pairing, back to HELLO\n", status);
+   clearPairingCode();
+   sessionToken_[0] = '\0';
+   sessionExpiresAt_[0] = '\0';
+   if (sessionInvalidCb_) sessionInvalidCb_();
+   advanceNetBackoff();
+   setState(State::HELLO);
+   nextHelloMs_ = millis() + netBackoffMs_;
+   return;
+ }
 
  if (status < 200 || status >= 300) {
    Serial.printf("[APPROVE] fail http status=%d\n", status);
@@ -1044,6 +1095,7 @@ void OrbiSyncNode::tryApprove() {
 
  const char* st = doc["status"] | "";
  const char* tok = doc["session_token"] | "";
+ const char* exp = doc["expires_at"] | doc["session_expires_at"] | "";
  const char* ntok = doc["register_token"] | doc["node_token"] | "";
  const char* tun = doc["tunnel_url"] | "";
  const char* nid = doc["node_id"] | doc["canonical_node_id"] | doc["resolved_node_id"] | "";
@@ -1051,6 +1103,15 @@ void OrbiSyncNode::tryApprove() {
  if (tok && tok[0]) {
    strncpy(sessionToken_, tok, sizeof(sessionToken_) - 1);
    sessionToken_[sizeof(sessionToken_) - 1] = '\0';
+ }
+ if (exp && exp[0]) {
+   size_t el = strlen(exp);
+   if (el < sizeof(sessionExpiresAt_)) {
+     strncpy(sessionExpiresAt_, exp, sizeof(sessionExpiresAt_) - 1);
+     sessionExpiresAt_[sizeof(sessionExpiresAt_) - 1] = '\0';
+   }
+ } else {
+   sessionExpiresAt_[0] = '\0';
  }
  if (ntok && ntok[0]) {
    strncpy(nodeToken_, ntok, sizeof(nodeToken_) - 1);
@@ -1078,6 +1139,95 @@ void OrbiSyncNode::tryApprove() {
  setState(State::ACTIVE);
  lastHeartbeatMs_ = millis();
  nextSessionPollMs_ = millis() + 60000;
+}
+
+// ---- 세션 갱신 (저장된 token으로 재부팅 시 먼저 시도) ----
+bool OrbiSyncNode::trySessionRefresh() {
+ if (!sessionToken_[0] || httpBusy_) return false;
+
+ const char* path = (cfg_.sessionEndpointPath && cfg_.sessionEndpointPath[0]) ? cfg_.sessionEndpointPath : "/api/device/session";
+
+ StaticJsonDocument<384> doc;
+ doc["slot_id"] = cfg_.slotId ? cfg_.slotId : "";
+ doc["session_token"] = sessionToken_;
+
+ char buf[384];
+ size_t n = serializeJson(doc, buf, sizeof(buf));
+ if (n == 0 || n >= sizeof(buf)) return false;
+ buf[n] = '\0';
+
+ if (cfg_.debugHttp) Serial.printf("[SESSION] refresh with stored token path=%s\n", path);
+ httpBusy_ = true;
+ int status = 0;
+ char resp[1024];
+ resp[0] = '\0';
+ bool ok = postJsonUnified(path, buf, &status, resp, sizeof(resp));
+ httpBusy_ = false;
+
+ yield();
+
+ size_t rl = strlen(resp);
+ if (cfg_.debugHttp && rl > 0) logBodyPreview("SESSION", resp, rl);
+
+ if (!ok) {
+   Serial.println("[SESSION] refresh fail (timeout/connect)");
+   return false;
+ }
+ if (status == 401 || status == 403 || status == 410) {
+   Serial.printf("[SESSION] refresh %d -> clear token, fallback HELLO\n", status);
+   sessionToken_[0] = '\0';
+   sessionExpiresAt_[0] = '\0';
+   if (sessionInvalidCb_) sessionInvalidCb_();
+   return false;
+ }
+ if (status != 200 && status != 201) {
+   Serial.printf("[SESSION] refresh status=%d -> fallback HELLO\n", status);
+   return false;
+ }
+
+ StaticJsonDocument<512> r;
+ size_t pl = (rl > 512) ? 512 : rl;
+ if (deserializeJson(r, resp, pl)) {
+   Serial.println("[SESSION] refresh parse err");
+   return false;
+ }
+
+ const char* st = r["status"] | "";
+ if (strcmp(st, "GRANTED") != 0) {
+   Serial.printf("[SESSION] refresh status body=%s -> fallback HELLO\n", st);
+   return false;
+ }
+
+ const char* tok = r["session_token"] | "";
+ const char* tun = r["tunnel_url"] | "";
+ const char* exp = r["expires_at"] | r["session_expires_at"] | "";
+ if (tok[0]) {
+   strncpy(sessionToken_, tok, sizeof(sessionToken_) - 1);
+   sessionToken_[sizeof(sessionToken_) - 1] = '\0';
+ }
+ if (exp[0]) {
+   size_t el = strlen(exp);
+   if (el < sizeof(sessionExpiresAt_)) {
+     strncpy(sessionExpiresAt_, exp, sizeof(sessionExpiresAt_) - 1);
+     sessionExpiresAt_[sizeof(sessionExpiresAt_) - 1] = '\0';
+   }
+ } else {
+   sessionExpiresAt_[0] = '\0';
+ }
+ if (cfg_.hubBaseUrl && buildWsTunnelUrl(cfg_.hubBaseUrl, tunnelUrl_, sizeof(tunnelUrl_))) {
+   nextTunnelConnectMs_ = 0;
+ } else if (tun[0]) {
+   strncpy(tunnelUrl_, tun, sizeof(tunnelUrl_) - 1);
+   tunnelUrl_[sizeof(tunnelUrl_) - 1] = '\0';
+   nextTunnelConnectMs_ = 0;
+ }
+
+ resetNetBackoff();
+ setState(State::ACTIVE);
+ lastHeartbeatMs_ = millis();
+ nextSessionPollMs_ = millis() + 60000;
+ Serial.println("[SESSION] refresh GRANTED -> ACTIVE (skip HELLO/approve)");
+ return true;
 }
 
 // ---- 세션 폴링 ----
@@ -1126,6 +1276,17 @@ void OrbiSyncNode::trySessionPoll() {
    nextSessionPollMs_ = millis() + 5000;
    return;
  }
+ if (status == 401 || status == 403 || status == 410) {
+   Serial.printf("[SESSION] %d invalid -> clear session & pairing, HELLO\n", status);
+   sessionToken_[0] = '\0';
+   sessionExpiresAt_[0] = '\0';
+   clearPairingCode();
+   if (sessionInvalidCb_) sessionInvalidCb_();
+   advanceNetBackoff();
+   setState(State::HELLO);
+   nextHelloMs_ = millis() + netBackoffMs_;
+   return;
+ }
 
  StaticJsonDocument<512> r;
  size_t pl = (rl > 512) ? 512 : rl;
@@ -1140,8 +1301,15 @@ void OrbiSyncNode::trySessionPoll() {
 
  if (strcmp(st, "GRANTED") == 0) {
    const char* tok = r["session_token"] | "";
+   const char* exp = r["expires_at"] | r["session_expires_at"] | "";
    const char* tun = r["tunnel_url"] | "";
    if (tok[0]) { strncpy(sessionToken_, tok, sizeof(sessionToken_) - 1); sessionToken_[sizeof(sessionToken_) - 1] = '\0'; }
+   if (exp[0] && strlen(exp) < sizeof(sessionExpiresAt_)) {
+     strncpy(sessionExpiresAt_, exp, sizeof(sessionExpiresAt_) - 1);
+     sessionExpiresAt_[sizeof(sessionExpiresAt_) - 1] = '\0';
+   } else {
+     sessionExpiresAt_[0] = '\0';
+   }
    if (tok[0] && cfg_.hubBaseUrl && buildWsTunnelUrl(cfg_.hubBaseUrl, tunnelUrl_, sizeof(tunnelUrl_))) {
      nextTunnelConnectMs_ = 0;
      Serial.printf("[TUNNEL] from session ws_url=%s\n", tunnelUrl_);
@@ -1291,10 +1459,19 @@ void OrbiSyncNode::runStateMachine() {
  if (WiFi.status() != WL_CONNECTED) return;
 
  switch (state_) {
-   case State::BOOT:
-     setState(State::HELLO);
-     nextHelloMs_ = millis();
+   case State::BOOT: {
+     if (sessionToken_[0]) {
+       if (trySessionRefresh()) {
+         break;
+       }
+       setState(State::HELLO);
+       nextHelloMs_ = millis() + netBackoffMs_;
+     } else {
+       setState(State::HELLO);
+       nextHelloMs_ = millis();
+     }
      break;
+   }
 
    case State::HELLO:
      tryHello();
@@ -1674,9 +1851,21 @@ void OrbiSyncNode::tunnelDisconnect() {
 }
 
 void OrbiSyncNode::setSessionToken(const char* token) {
- if (!token) { sessionToken_[0] = '\0'; return; }
+ if (!token) {
+   sessionToken_[0] = '\0';
+   sessionExpiresAt_[0] = '\0';
+   return;
+ }
  strncpy(sessionToken_, token, sizeof(sessionToken_) - 1);
  sessionToken_[sizeof(sessionToken_) - 1] = '\0';
+}
+
+void OrbiSyncNode::setSessionExpiresAt(const char* expiresAt) {
+ if (!expiresAt) { sessionExpiresAt_[0] = '\0'; return; }
+ size_t el = strlen(expiresAt);
+ if (el >= sizeof(sessionExpiresAt_)) el = sizeof(sessionExpiresAt_) - 1;
+ memcpy(sessionExpiresAt_, expiresAt, el);
+ sessionExpiresAt_[el] = '\0';
 }
 
 bool OrbiSyncNode::tunnelSendText(const char* text) {
