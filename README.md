@@ -112,6 +112,124 @@ Arduino(Node)                    Hub                                        Web(
      |<-- DENIED(FULL) -----------|                                           |
 ```
 
+
+## Device Pairing & Session Flow ⭐ (상세 흐름)
+HELLO → PENDING → POLL → GRANTED
+토큰 발급 과정 상세
+(지금 만든 다이어그램)
+시간 →
+Node                    Hub                       Web(UI)
+   |                       |                         |
+   |--- HELLO ------------>|                         |
+   |<-- PENDING -----------|  /api/sessions/approve  |                    |
+   |                       |---- handshake --------->|
+   |                       |                         |-- token 생성
+   |                       |<------------------------|
+   |                       |   (token ready)         |
+   |                       |                         |
+   |--- POLL ------------->|                         |
+   |<-- GRANTED(token) ----|                         |
+
+
+
+POST /api/sessions/approve
+Headers
+Authorization: Bearer {admin_token}
+Content-Type: application/json
+
+Body
+{
+  "node_id": "node-esp32-001",
+  "slot_id": "slot-A1",
+  "ttl": 3600,
+  "capabilities": ["heartbeat", "commands", "tunnel"],
+  "metadata": {
+    "name": "회의실 도어락",
+    "location": "3층 A룸"
+  }
+}
+
+🔹 파라미터 설명
+필드	타입	필수	설명
+node_id	string	✅	HELLO에서 온 노드 ID
+slot_id	string	❌	할당 슬롯
+ttl	int	❌	세션 유효시간 (초)
+capabilities	array	❌	허용 기능
+metadata	object	❌	UI 표시용 정보
+
+
+
+
+✅ Hub 내부 동작
+
+handshake 호출 시:
+
+Hub가 수행할 일
+1. node pending 상태 확인
+2. 세션 생성
+3. token 발급 (JWT or random)
+4. DB 저장
+5. status → APPROVED 변경
+6. 다음 poll 시 GRANTED 응답
+
+✅ Response 정의
+성공 (200)
+{
+  "status": "approved",
+  "node_id": "node-esp32-001",
+  "session": {
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "expires_at": "2026-02-01T18:20:00Z",
+    "ttl": 3600,
+    "tunnel_url": "wss://hub.orbisync.io/ws/node-esp32-001"
+  }
+}
+
+실패 케이스
+노드 없음
+404
+{
+  "error": "node_not_found"
+}
+
+이미 승인됨
+409
+{
+  "error": "already_active"
+}
+
+권한 없음
+401
+{
+  "error": "unauthorized"
+}
+
+
+✅ Node 쪽 흐름 연결
+
+Node는 handshake를 직접 호출하지 않음
+👉 계속 pollSession()만 수행
+
+Hub → Node 응답:
+
+아직 미승인
+{
+  "status": "pending"
+}
+
+승인 완료
+{
+  "status": "granted",
+  "token": "xxxxx",
+  "ttl": 3600,
+  "tunnel_url": "wss://..."
+}
+
+
+이때:
+
+state = ACTIVE
+WebSocket 연결 시작
 ---
 
 # 🔁 State Machine

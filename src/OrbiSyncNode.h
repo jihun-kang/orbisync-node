@@ -1,333 +1,284 @@
 /**
- * @file    OrbiSyncNode.h
- * @author  jihun kang
- * @date    2026-01-29
- * @brief   OrbiSyncNode 라이브러리의 public API 및 클래스 정의
- *
+ * @file   OrbiSyncNode.h
+ * @brief  ESP32/ESP8266용 OrbiSync Hub 터널 클라이언트 라이브러리
  * @details
- * 이 파일은 OrbiSyncNode 라이브러리의 핵심 인터페이스를 정의합니다.
- * ESP8266/ESP32 기반 IoT 노드가 OrbiSync Hub와 통신하기 위한 상태 머신,
- * 콜백 인터페이스, 요청/응답 구조체를 제공합니다.
- *
- * - 상태 머신 정의 (BOOT → HELLO → PENDING_POLL → ACTIVE → ERROR)
- * - 이벤트 콜백 인터페이스 (상태 변경, 에러, 등록, 터널 연결, HTTP 요청)
- * - HTTP/COAP 요청 처리 구조체 (Request/Response)
- * - WiFi 연결, Hub 통신, WebSocket 터널링 API
- *
- * 본 코드는 OrbiSync 오픈소스 프로젝트의 일부입니다.
- * 라이선스 및 사용 조건은 LICENSE 파일을 참고하세요.
+ * - Hub와 WebSocket 터널 연결 및 HTTP 요청 처리
+ * - 상태머신 기반 등록/승인/세션 관리
+ * - 메모리 안정화: static 클라이언트 재사용, String 최소화
  */
+ #ifndef ORBISYNC_NODE_H
+ #define ORBISYNC_NODE_H
+ 
+ #include <stdint.h>
+ #include <stddef.h>
+ 
+ #define ORBISYNC_HAS_TUNNEL_CONFIG 1
+ #define ORBISYNC_HAS_TUNNEL_STATES 1
+ 
+namespace OrbiSyncNode {
 
- #ifndef ORBI_SYNC_NODE_H
- #define ORBI_SYNC_NODE_H
+/// 노드 상태머신
+enum class State {
+  BOOT,              /// 초기화 중
+  HELLO,             /// Hub에 hello 전송
+  PAIR_SUBMIT,       /// 페어링 코드 제출
+  PENDING_POLL,      /// 세션 폴링 대기
+  GRANTED,           /// 세션 승인됨
+  ACTIVE,            /// 세션 활성화됨
+  TUNNEL_CONNECTING, /// 터널 연결 시도 중
+  TUNNEL_CONNECTED,  /// 터널 연결됨
+  ERROR,             /// 에러 상태
+};
+
+enum class Protocol { HTTP, WS };
  
- #include <Arduino.h>
- #include <ArduinoJson.hpp>
+#define TUNNEL_MAX_HEADERS 8
+/// Hub → Node HTTP 요청 구조체
+struct TunnelHttpRequest {
+  const char* requestId;
+  const char* streamId;  /// 응답 매칭용 ID
+  const char* tunnelId;
+  const char* method;
+  const char* path;
+  const char* query;
+  const uint8_t* body;
+  size_t bodyLen;
+
+  const char* getHeader(const char* key) const;
+
+  uint8_t headerCount;
+  struct { char key[24]; char value[80]; } headers[TUNNEL_MAX_HEADERS];
+};
+
+class OrbiSyncNode;
+
+/// Node → Hub HTTP 응답 작성기 (2KB body 버퍼)
+class TunnelHttpResponseWriter {
+  public:
+   void setStatus(int code);
+   void setHeader(const char* key, const char* value);
+   void write(const uint8_t* data, size_t len);
+   void write(const char* str);
+   void end();
  
- namespace AJ = ArduinoJson;
- using JsonArray = AJ::JsonArray;
- using JsonDocument = AJ::JsonDocument;
- using JsonObject = AJ::JsonObject;
- using DeserializationError = AJ::DeserializationError;
- using DynamicJsonDocument = AJ::DynamicJsonDocument;
- template <size_t N>
- using StaticJsonDocument = AJ::StaticJsonDocument<N>;
- 
- #if defined(ESP32)
- #include <WiFi.h>
- #include <WiFiClientSecure.h>
- #include <HTTPClient.h>
- #elif defined(ESP8266)
- #include <ESP8266WiFi.h>
- #include <WiFiClientSecureBearSSL.h>
- #include <ESP8266HTTPClient.h>
- #else
- #error "Unsupported board for OrbiSyncNode"
- #endif
- #include <WebSocketsClient.h>
- 
- namespace OrbiSyncNodeConstants {
-   constexpr size_t kMaxResponseLength = 2048;
-   constexpr size_t kMaxStreamRequestSize = 4096;
-   constexpr uint32_t kWsHeartbeatIntervalMs = 30000;
- }
- 
- class OrbiSyncNode {
- public:
-   enum class State {
-     BOOT,
-     HELLO,
-     PENDING_POLL,
-     ACTIVE,
-     ERROR
-   };
- 
-   enum class Protocol {
-     HTTP,
-     COAP
-   };
- 
-   struct Request {
-     Protocol proto;
-     const char* method;
-     const char* path;
-     const uint8_t* body;
-     size_t body_len;
-   };
- 
-   struct Response {
-     int status;
-     const char* content_type;
-     const uint8_t* body;
-     size_t body_len;
-   };
- 
-   using RequestHandler = bool(*)(const Request&, Response&);
-   using RequestCallback = RequestHandler; // 별칭
-   using StateChangeCallback = void(*)(State oldState, State newState);
-   using ErrorCallback = void(*)(const char* error);
-   using RegisterCallback = void(*)(const char* nodeId);
-   using TunnelCallback = void(*)(bool connected, const char* url);
- 
-   struct Config {
-     const char* hubBaseUrl;
-     const char* slotId;
-     const char* firmwareVersion;
-     const char* const* capabilities;
-     uint8_t capabilityCount;
-     uint32_t heartbeatIntervalMs;
-     uint8_t ledPin;
-     bool blinkOnHeartbeat;
-     bool allowInsecureTls;
-     const char* rootCaPem;
-     bool enableCommandPolling;
-     uint32_t commandPollIntervalMs;
-     const char* loginToken;
-     const char* machineId;
-     const char* nodeName;
-     // (권장) 접두사(prefix) + 디바이스 고유값(ChipID/MAC) 조합을 위해 사용
-     // - machineIdPrefix/nodeNamePrefix가 설정되면 machineId/nodeName보다 우선합니다.
-     // - appendUniqueSuffix=true이면 prefix 뒤에 고유 suffix를 자동으로 붙입니다.
-     const char* machineIdPrefix;
-     const char* nodeNamePrefix;
-     bool appendUniqueSuffix = true;
-     bool useMacForUniqueId = true;
-     
-     const char* pairingCode;
-     const char* internalKey;
-     bool enableNodeRegistration;
-     uint32_t registerRetryMs;
-     bool preferRegisterBySlot;
-     bool enableTunnel;
-   };
- 
-   explicit OrbiSyncNode(const Config& config);
-   ~OrbiSyncNode();
- 
-   /**
-    * 역할: STA 모드 Wi-Fi 연결을 시작하고 타이머 초기화
-    * 인자: SSID, 비밀번호
-    * 반환: 현재 Wi-Fi 상태가 연결되어 있으면 true
-    * 실패 처리: 인증 정보 부족 시 last_error_ 설정 후 반복
-    */
-   bool beginWiFi(const char* ssid, const char* pass);
- 
-   /**
-    * 역할: /api/device/hello POST 호출 (slot_id, device_info, nonce, firmware, capabilities_hash 포함)
-    * 인자: 없음
-    * 반환: 서버 응답을 정상 처리하면 true
-    * 실패 처리: last_error_ 기록 + next_net_action_ms_ 연기
-    */
-   bool sendHello();
- 
-   /**
-    * 역할: /api/device/session 폴링 (slot_id, nonce)
-    * 인자: 없음
-    * 반환: 상태 파악 후 HELLO/PENDING/ACTIVE 전이 성공하면 true
-    * 실패 처리: HTTP 에러는 backoff, 401/403은 세션 폐기 후 HELLO
-    */
-   bool pollSession();
- 
-   /**
-    * 역할: /api/device/heartbeat POST 보내기 (slot_id, nonce, uptime, rssi 등 포함)
-    * 인자: 없음
-    * 반환: 2xx 응답 시 true
-    * 실패 처리: 401/403은 세션 폐기, 비인증 에러는 backoff
-    */
-   bool sendHeartbeat();
- 
-   /**
-    * 역할: (선택) /api/device/commands/pull로 명령 폴링 및 ack 전송
-    * 인자: 없음
-    * 반환: 통신 성공이면 true
-    * 실패 처리: HTTP 에러는 backoff
-    */
-   bool pullCommands();
- 
-   /**
-    * 역할: RAM 세션 유효성 판단
-    * 인자: 없음
-    * 반환: session_token_가 존재하고 TTL이 지나지 않았다면 true
-    */
-   bool isSessionValid() const;
- 
-   bool isRegistered() const;
-   const char* getNodeId() const;
-   const char* getNodeAuthToken() const;
-   const char* getTunnelUrl() const;
- 
-   // 식별자/토큰 유틸리티
-   // - MACHINE_ID / NODE_NAME은 (prefix + 고유 suffix)로 라이브러리 내부에서 자동 생성됩니다.
-   // - LOGIN_TOKEN은 (register_by_slot 등에 사용될 경우) 런타임에 갱신할 수 있습니다.
-   const char* getMachineId() const;
-   const char* getNodeName() const;
-   void setLoginToken(const char* loginToken);
-   bool isTunnelConnected() const;
- 
-   /**
-    * 역할: 전체 상태 머신 루프 (Wi-Fi, HELLO, PENDING, ACTIVE 등 처리)
-    * 인자: 없음
-    * 반환: 없음
-    */
-   void loopTick();
- 
-   State getState() const;
-   const char* getLastError() const;
-   void clearSession();
- 
-   /**
-    * 역할: HTTP/COAP 요청 처리 핸들러 등록
-    * 인자: 요청 처리 콜백 함수 포인터
-    * 반환: 없음
-    * 참고: callback이 true를 반환하면 그 응답을 사용, false면 기본 라우팅으로 fallback
-    */
-   void onRequest(RequestCallback callback);
- 
-   /**
-    * 역할: 상태 변경 콜백 등록
-    * 인자: 상태 변경 시 호출될 콜백 함수 포인터
-    * 반환: 없음
-    */
-   void onStateChange(StateChangeCallback callback);
- 
-   /**
-    * 역할: 에러 발생 콜백 등록
-    * 인자: 에러 발생 시 호출될 콜백 함수 포인터
-    * 반환: 없음
-    */
-   void onError(ErrorCallback callback);
- 
-   /**
-    * 역할: 노드 등록 완료 콜백 등록
-    * 인자: 노드 등록 성공 시 호출될 콜백 함수 포인터
-    * 반환: 없음
-    */
-   void onRegistered(RegisterCallback callback);
- 
-   /**
-    * 역할: 터널(WebSocket) 연결 상태 변경 콜백 등록
-    * 인자: 터널 연결/해제 시 호출될 콜백 함수 포인터
-    * 반환: 없음
-    */
-   void onTunnelChange(TunnelCallback callback);
- 
-   bool registerNodeIfNeeded(uint32_t now);
-   bool registerBySlot();
-   bool registerByPairing();
-   bool connectTunnelWs(uint32_t now);
-   bool sendRegisterFrame();
-   bool sendHeartbeatFrame();
-   void handleWsEvent(WStype_t type, uint8_t* payload, size_t length);
- 
- private:
-   bool ensureWiFi();
-   String createNonce();
-   void setLastError(const char* msg);
-   void transitionTo(State newState);
-   void scheduleNextNetwork(uint32_t delayMs = 0);
-   void scheduleNextWiFi(uint32_t delayMs = 0);
-   void processActive(uint32_t now);
-   bool applyTlsPolicy();
-   bool handleCommand(JsonObject command);
-   String capabilitiesHash() const;
-   void ensureIdentityInitialized();
-   String makeUniqueSuffix() const;
-   bool responseToJson(JsonDocument& doc);
-   void scheduleRegisterRetry(uint32_t now);
-   void scheduleWsRetry(uint32_t now);
-   bool parseTunnelUrl(const char* raw, String& host, uint16_t& port, String& path, bool& secure) const;
-   void handleWsMessage(const uint8_t* payload, size_t length);
-   void handleControl(JsonDocument& doc);
-   void handleData(JsonDocument& doc);
-   bool tryProcessHttpRequest();
-   String buildHttpRawResponse(int statusCode, const String& jsonBody, const char* contentType = "application/json");
-   String routeHttpRequest(const String& method, const String& path, const String& body, int& statusCode);
-   bool sendDataFrame(const char* streamId, const uint8_t* data, size_t len);
-   static String base64Encode(const uint8_t* data, size_t length);
-   static bool base64Decode(const char* input, uint8_t* output, size_t& outLen);
- 
-   Config config_;
-   State state_;
-   String wifi_ssid_;
-   String wifi_password_;
- #if defined(ESP8266)
-   BearSSL::WiFiClientSecure secure_client_;
- #else
-   WiFiClientSecure secure_client_;
- #endif
-   WiFiClient insecure_client_;
- #if defined(ESP8266)
-   HTTPClient http_;
- #else
-   HTTPClient http_;
- #endif
-   bool use_https_;
-   uint32_t next_wifi_action_ms_;
-   uint32_t next_net_action_ms_;
-   uint32_t next_command_action_ms_;
-   uint32_t wifi_backoff_ms_;
-   uint32_t net_backoff_ms_;
-   uint32_t register_backoff_ms_;
-   uint32_t next_register_action_ms_;
-   uint32_t session_expires_at_ms_;
-   uint32_t last_heartbeat_ms_;
-   char session_token_[256];
-   char node_id_[64];
-   char node_auth_token_[128];
-   char tunnel_url_[192];
-   char active_stream_id_[64];
-   bool stream_open_;
-   String request_buf_;
-   bool is_registered_;
-   char last_error_[128];
-   bool led_state_;
-   WebSocketsClient ws_client_;
-   String ws_extra_headers_;
-   // 런타임 생성된 식별자/토큰 저장소(수명 보장용)
-   String machine_id_str_;
-   String node_name_str_;
-   String login_token_str_;
-   const char* machine_id_ptr_;
-   const char* node_name_ptr_;
-   bool ws_connected_;
-   bool ws_register_frame_sent_;
-   uint32_t ws_backoff_ms_;
-   uint32_t next_ws_action_ms_;
-   uint32_t ws_last_heartbeat_ms_;
-   RequestHandler request_handler_;
-   StateChangeCallback state_change_callback_;
-   ErrorCallback error_callback_;
-   RegisterCallback register_callback_;
-   TunnelCallback tunnel_callback_;
-   bool ws_connected_prev_;
-   State state_prev_;
-   
-   // TLS 인증서 관리 (ESP8266 전용)
- #if defined(ESP8266)
-   BearSSL::X509List* ca_cert_ = nullptr;
-   String last_root_ca_pem_;
- #endif
+  private:
+   friend class OrbiSyncNode;
+   TunnelHttpResponseWriter();
+   void* node_;
+   char requestId_[48];
+   int statusCode_;
+   uint8_t headerCount_;
+   struct { char key[24]; char value[80]; } headers_[TUNNEL_MAX_HEADERS];
+   uint8_t body_[2048];
+   size_t bodyLen_;
+   bool ended_;
  };
  
- #endif // ORBI_SYNC_NODE_H
+ typedef void (*HttpRequestCallback)(const TunnelHttpRequest& req, TunnelHttpResponseWriter& res);
+ 
+ struct Config {
+   const char* hubBaseUrl;          // "https://hub.orbisync.io" 권장
+   const char* slotId;
+   const char* firmwareVersion;
+ 
+   const char* const* capabilities;
+   uint8_t capabilityCount;
+ 
+   uint32_t heartbeatIntervalMs;
+   int ledPin;
+   bool blinkOnHeartbeat;
+ 
+   bool allowInsecureTls;           // true면 setInsecure(개발용)
+   const char* rootCaPem;           // (선택) CA PEM
+ 
+   bool enableCommandPolling;
+   uint32_t commandPollIntervalMs;
+ 
+   const char* machineIdPrefix;     // default "node-"
+   const char* nodeNamePrefix;      // default "Node-"
+   bool appendUniqueSuffix;
+   bool useMacForUniqueId;
+ 
+   bool enableTunnel;               // true면 WS 터널 사용
+   bool enableNodeRegistration;
+ 
+   uint32_t registerRetryMs;
+ 
+   bool preferRegisterBySlot;
+   bool enableSelfApprove;
+   const char* approveEndpointPath; // 예: "/api/device/approve"
+   const char* selfApproveKey;
+   uint32_t approveRetryMs;
+ 
+   const char* sessionEndpointPath; // default "/api/device/session"
+ 
+   bool debugHttp;
+   bool maskMacInLogs;
+ 
+   const char* loginToken;          // register_by_slot 사용 시
+   const char* pairingCode;         // (옵션) 고정 pairing
+   const char* internalKey;
+ 
+   size_t maxTunnelBodyBytes;       // default 4096
+   uint32_t tunnelReconnectMs;      // default 5000
+ };
+ 
+ struct Request {
+   Protocol proto;
+   const char* method;
+   const char* path;
+   const uint8_t* body;
+   size_t body_len;
+ };
+ 
+ struct Response {
+   int status;
+   const char* content_type;
+   const uint8_t* body;
+   size_t body_len;
+ };
+ 
+ typedef void (*StateChangeCB)(State oldState, State newState);
+ typedef void (*ErrorCB)(const char* error);
+ typedef void (*RegisteredCB)(const char* nodeId);
+ typedef void (*TunnelChangeCB)(bool connected, const char* url);
+ typedef bool (*RequestHandler)(const Request& req, Response& resp);
+ typedef void (*TunnelMessageCB)(const char* json);
+ 
+/// ESP32 터널 연결 및 HTTP 요청 처리 담당 클래스
+class OrbiSyncNode {
+ public:
+   explicit OrbiSyncNode(const Config& config);
+
+   /// WiFi 연결 시작
+   void beginWiFi(const char* ssid, const char* pass);
+   /// 메인 루프 (상태머신 실행)
+   void loopTick();
+
+   void onStateChange(StateChangeCB cb) { stateChangeCb_ = cb; }
+   void onError(ErrorCB cb) { errorCb_ = cb; }
+   void onRegistered(RegisteredCB cb) { registeredCb_ = cb; }
+   void onTunnelChange(TunnelChangeCB cb) { tunnelChangeCb_ = cb; }
+   void onRequest(RequestHandler h) { requestHandler_ = h; }
+   void onTunnelMessage(TunnelMessageCB cb) { tunnelMessageCb_ = cb; }
+   void onHttpRequest(HttpRequestCallback cb) { httpRequestCb_ = cb; }
+   void setHttpRequestHandler(HttpRequestCallback cb) { httpRequestCb_ = cb; }
+
+   State getState() const { return state_; }
+   const char* getNodeId() const { return nodeId_; }
+   const char* getTunnelUrl() const { return tunnelUrl_; }
+   const char* getTunnelId() const { return tunnelId_; }
+   const char* getSessionToken() const { return sessionToken_; }
+   const char* getNodeToken() const { return nodeToken_; }
+
+   /// 세션 토큰 외부 설정
+   void setSessionToken(const char* token);
+
+   // ---- 터널 관련 public 함수 ----
+   /// 터널 연결 루프 (재연결/keepalive 처리)
+   void tunnelLoop();
+   /// WebSocket 연결 시작
+   void tunnelConnect();
+   /// WebSocket 연결 종료
+   void tunnelDisconnect();
+   /// Hub에 register 요청 전송
+   void tunnelSendRegister();
+
+   // ---- WebSocket 메시지 핸들러 ----
+   void tunnelHandleMessage(const char* payload);                 /// 호환용
+   void tunnelHandleMessage(const uint8_t* payload, size_t len);  /// 권장(복사/할당 없음)
+   /// proxy_request 타입 메시지 처리
+   void tunnelHandleProxyRequest(const uint8_t* payload, size_t len);
+
+   /// WebSocket으로 텍스트 전송
+   bool tunnelSendText(const char* text);
+   /// HTTP 응답 전송 (stream_id 매칭)
+   void tunnelSendProxyResponse(TunnelHttpResponseWriter& res);
+ 
+  private:
+   Config cfg_;
+   State state_;
+ 
+   char nodeId_[64];
+   char nodeToken_[256];
+   char tunnelUrl_[256];
+   char tunnelId_[64];
+   char sessionToken_[256];
+ 
+   static constexpr size_t kPairingCodeMax = 32;
+   char pairingCode_[kPairingCodeMax];
+   char pairingExpiresAt_[32];
+   bool pairingCodeValid_;
+ 
+   uint32_t nextHelloMs_;
+   uint32_t nextPairMs_;
+   uint32_t nextApproveMs_;
+   uint32_t nextSessionPollMs_;
+   uint32_t nextRegisterBySlotMs_;
+ 
+   uint32_t netBackoffMs_;
+   uint32_t pairBackoffMs_;
+ 
+   uint32_t nextTunnelConnectMs_;
+   uint32_t tunnelBackoffMs_;
+   uint8_t  tunnelBackoffIndex_;
+   uint32_t lastTunnelPingMs_;
+   bool tunnelRegistered_;
+   bool approveMissingMacFailed_;
+ 
+   uint32_t lastHeartbeatMs_;
+   bool wifiConnecting_;
+   bool httpBusy_;
+ 
+   StateChangeCB stateChangeCb_;
+   ErrorCB errorCb_;
+   RegisteredCB registeredCb_;
+   TunnelChangeCB tunnelChangeCb_;
+   RequestHandler requestHandler_;
+   TunnelMessageCB tunnelMessageCb_;
+   HttpRequestCallback httpRequestCb_;
+ 
+   // ---- 내부 상태 관리 ----
+   void setState(State s);
+   void ensureWiFi();
+   void runStateMachine();
+
+   // ---- Hub API 호출 ----
+   void tryHello();
+   void handleHelloResponse(int status, const char* body, size_t len);
+   void tryPairIfNeeded();
+   bool postDevicePair(const char* code, int* outStatus, char* outBody, size_t outBodyMax);
+   void tryApprove();
+   void trySessionPoll();
+   void tryRegisterBySlot();
+   bool postJsonUnified(const char* path, const char* body, int* outStatus,
+                        char* outBody, size_t outBodyMax);
+
+   // ---- 유틸리티 ----
+   const char* getMacCStr();
+   void getMachineId(char* buf, size_t size);
+   void getDeviceInfoJson(char* buf, size_t size);
+   uint32_t computeCapabilitiesHash() const;
+   bool isPairingExpired() const;
+   void clearPairingCode();
+   void storePairingFromHello(const char* code, const char* expiresAt);
+
+   // ---- 백오프 관리 ----
+   void advanceNetBackoff();
+   void advancePairBackoff();
+   void resetNetBackoff();
+   void resetPairBackoff();
+
+   /// 터널 연결 종료 후 정리 (상태/백오프/콜백만, 포인터 삭제 없음)
+   void tunnelDisconnectCleanup();
+
+   /// Hub에 heartbeat 전송
+   void tryHeartbeat();
+ };
+ 
+ }  // namespace OrbiSyncNode
+ 
+ using OrbiSyncNodeType = OrbiSyncNode::OrbiSyncNode;
+ 
+ #endif  // ORBISYNC_NODE_H
  
